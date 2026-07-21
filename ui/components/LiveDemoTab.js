@@ -1,10 +1,10 @@
 // Live Demo Tab Component - Enhanced Version
 
-import { PoseDetectionCanvas } from './PoseDetectionCanvas.js';
-import { poseService } from '../services/pose.service.js';
-import { streamService } from '../services/stream.service.js';
-import { wsService } from '../services/websocket.service.js';
-import { sensingService } from '../services/sensing.service.js';
+import { PoseDetectionCanvas } from './PoseDetectionCanvas.js?v=pose-cache-clear-20260713-2';
+import { poseService } from '../services/pose.service.js?v=pose-cache-clear-20260713-2';
+import { streamService } from '../services/stream.service.js?v=pose-cache-clear-20260713-2';
+import { wsService } from '../services/websocket.service.js?v=pose-cache-clear-20260713-2';
+import { sensingService } from '../services/sensing.service.js?v=pose-cache-clear-20260713-2';
 
 // Optional services - loaded lazily in init() to avoid blocking module graph
 let modelService = null;
@@ -87,11 +87,11 @@ export class LiveDemoTab {
 
       // Load optional services (non-blocking)
       try {
-        const mod = await import('../services/model.service.js');
+        const mod = await import('../services/model.service.js?v=pose-cache-clear-20260713-2');
         modelService = mod.modelService;
       } catch (e) { /* model features disabled */ }
       try {
-        const mod = await import('../services/training.service.js');
+        const mod = await import('../services/training.service.js?v=pose-cache-clear-20260713-2');
         trainingService = mod.trainingService;
       } catch (e) { /* training features disabled */ }
 
@@ -119,16 +119,16 @@ export class LiveDemoTab {
       // Auto-start pose detection when a backend is reachable.
       // Check after a brief delay (sensing WS may still be connecting).
       this._autoStartOnce = false;
-      const tryAutoStart = () => {
+      const tryAutoStart = (force = false) => {
         if (this._autoStartOnce || this.state.isActive) return;
         const ds = sensingService.dataSource;
-        if (ds === 'live' || ds === 'server-simulated') {
+        if (force || ds === 'live' || ds === 'server-simulated') {
           this._autoStartOnce = true;
-          this.logger.info('Auto-starting pose detection (data source: ' + ds + ')');
+          this.logger.info('Auto-starting pose detection (data source: ' + (ds || 'unknown') + ')');
           this.startDemo();
         }
       };
-      setTimeout(tryAutoStart, 2000);
+      setTimeout(() => tryAutoStart(true), 1200);
       // Also listen for sensing state changes in case server connects later
       this._autoStartUnsub = sensingService.onStateChange(tryAutoStart);
 

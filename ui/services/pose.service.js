@@ -140,7 +140,7 @@ export class PoseService {
       zone_ids: options.zoneIds?.join(','),
       min_confidence: options.minConfidence || defaultThreshold,
       max_fps: options.maxFps || 30,
-      token: options.token || apiService.authToken
+      token: options.token || apiService.getAuthToken()
     };
 
     // Remove undefined values
@@ -330,6 +330,20 @@ export class PoseService {
           });
           break;
 
+        case 'fall_status':
+          this.notifyPoseSubscribers({
+            type: 'fall_status',
+            data: actualData || data.payload || data
+          });
+          break;
+
+        case 'fall_event':
+          this.notifyPoseSubscribers({
+            type: 'fall_event',
+            data: actualData || data.payload || data
+          });
+          break;
+
         case 'historical_data':
           this.logger.debug('Historical data received');
           this.notifyPoseSubscribers({
@@ -505,6 +519,8 @@ export class PoseService {
 
     // Determine the pose source for this message
     const poseSource = originalMessage.pose_source || zoneData.pose_source || null;
+    const poseMode = originalMessage.pose_mode || zoneData.pose_mode || null;
+    const isHeuristicPose = poseMode === 'heuristic' || poseSource === 'signal_derived';
 
     // Choose confidence threshold based on pose source
     const threshold = (poseSource === 'model_inference' || this.modelActive)
@@ -513,7 +529,9 @@ export class PoseService {
 
     // Extract persons from zone data, applying source-aware filtering
     const rawPersons = zoneData.pose.persons || [];
-    const persons = rawPersons.filter(p => p.confidence === undefined || p.confidence >= threshold);
+    const persons = isHeuristicPose
+      ? rawPersons
+      : rawPersons.filter(p => p.confidence === undefined || p.confidence >= threshold);
     console.log('Extracted persons:', persons.length, '/', rawPersons.length, '(threshold:', threshold, ')');
     
     // Create zone summary
@@ -530,6 +548,10 @@ export class PoseService {
       zone_summary: zoneSummary,
       processing_time_ms: zoneData.metadata?.processing_time_ms || 0,
       pose_source: poseSource,
+      pose_mode: poseMode,
+      pose_label: originalMessage.pose_label || zoneData.pose_label || null,
+      diagnostics: originalMessage.diagnostics || zoneData.diagnostics || null,
+      fall_status: originalMessage.fall_status || zoneData.fall_status || null,
       metadata: {
         mock_data: false,
         source: 'websocket',
@@ -564,7 +586,7 @@ export class PoseService {
     const params = {
       event_types: options.eventTypes?.join(','),
       zone_ids: options.zoneIds?.join(','),
-      token: options.token || apiService.authToken
+      token: options.token || apiService.getAuthToken()
     };
 
     // Remove undefined values

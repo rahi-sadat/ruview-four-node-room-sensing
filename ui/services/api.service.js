@@ -3,16 +3,40 @@
 import { API_CONFIG, buildApiUrl } from '../config/api.config.js';
 import { backendDetector } from '../utils/backend-detector.js';
 
+const AUTH_TOKEN_STORAGE_KEY = 'ruview_token';
+
 export class ApiService {
   constructor() {
-    this.authToken = null;
+    this.authToken = this.readStoredAuthToken();
     this.requestInterceptors = [];
     this.responseInterceptors = [];
   }
 
+  readStoredAuthToken() {
+    try {
+      return localStorage.getItem(AUTH_TOKEN_STORAGE_KEY);
+    } catch {
+      return null;
+    }
+  }
+
+  getAuthToken() {
+    return this.authToken || this.readStoredAuthToken();
+  }
+
   // Set authentication token
   setAuthToken(token) {
-    this.authToken = token;
+    this.authToken = token || null;
+
+    try {
+      if (this.authToken) {
+        localStorage.setItem(AUTH_TOKEN_STORAGE_KEY, this.authToken);
+      } else {
+        localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
+      }
+    } catch {
+      // localStorage can be unavailable in tests or private contexts.
+    }
   }
 
   // Add request interceptor
@@ -32,8 +56,9 @@ export class ApiService {
       ...customHeaders
     };
 
-    if (this.authToken) {
-      headers['Authorization'] = `Bearer ${this.authToken}`;
+    const token = this.getAuthToken();
+    if (token) {
+      headers['Authorization'] = `Bearer ${token}`;
     }
 
     return headers;

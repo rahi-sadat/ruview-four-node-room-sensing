@@ -112,7 +112,8 @@ export class SensingTab {
               Metrics are computed from WiFi Channel State Information (CSI).
               With <strong><span id="sensingNodeCount">0</span> ESP32 node(s)</strong> you get presence detection, breathing
               estimation, and gross motion. Add <strong>3-4+ ESP32 nodes</strong>
-              around the room for spatial resolution and limb-level tracking.
+              around the room for spatial resolution; limb-level pose still
+              requires a trained room-specific model.
             </p>
           </div>
 
@@ -192,6 +193,10 @@ export class SensingTab {
   }
 
   _onSensingData(data) {
+    if (data && data.type && data.type !== 'sensing_update') {
+      return;
+    }
+
     // Update 3D view
     if (this.splatRenderer) {
       this.splatRenderer.update(data);
@@ -239,11 +244,15 @@ export class SensingTab {
   // ---- HUD update --------------------------------------------------------
 
   _updateHUD(data) {
+    if (data && data.type && data.type !== 'sensing_update') {
+      return;
+    }
+
     const f = data.features || {};
     const c = data.classification || {};
 
     // Node count
-    const nodeCount = (data.nodes || []).length;
+    const nodeCount = this._getNodeCount(data);
     const countEl = this.container.querySelector('#sensingNodeCount');
     if (countEl) countEl.textContent = String(nodeCount);
 
@@ -326,9 +335,13 @@ export class SensingTab {
   // ---- Per-node panels ---------------------------------------------------
 
   _updateNodePanels(data) {
+    if (data && data.type && data.type !== 'sensing_update') {
+      return;
+    }
+
     const container = this.container.querySelector('#nodeStatusContainer');
     if (!container) return;
-    const nodeFeatures = data.node_features || [];
+    const nodeFeatures = this._getNodeFeatures(data);
     if (nodeFeatures.length === 0) {
       container.textContent = '';
       const msg = document.createElement('div');
@@ -372,6 +385,34 @@ export class SensingTab {
       row.appendChild(classCol);
       container.appendChild(row);
     }
+  }
+
+  _getNodeCount(data) {
+    const ids = new Set();
+    for (const nf of data.node_features || []) {
+      if (nf.node_id != null) ids.add(nf.node_id);
+    }
+    for (const node of data.nodes || []) {
+      if (node.node_id != null) ids.add(node.node_id);
+    }
+    return ids.size;
+  }
+
+  _getNodeFeatures(data) {
+    if (Array.isArray(data.node_features) && data.node_features.length > 0) {
+      return data.node_features;
+    }
+
+    return (data.nodes || []).map((node) => ({
+      node_id: node.node_id,
+      rssi_dbm: node.rssi_dbm,
+      stale: Boolean(node.stale),
+      features: {},
+      classification: {
+        motion_level: node.stale ? 'stale' : 'unknown',
+        confidence: 0,
+      },
+    }));
   }
 
   // ---- Resize ------------------------------------------------------------

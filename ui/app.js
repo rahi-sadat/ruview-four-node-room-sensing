@@ -1,33 +1,33 @@
 // WiFi DensePose Application - Main Entry Point
 
-import { TabManager } from './components/TabManager.js';
-import { DashboardTab } from './components/DashboardTab.js';
-import { HardwareTab } from './components/HardwareTab.js';
-import { LiveDemoTab } from './components/LiveDemoTab.js';
-import { SensingTab } from './components/SensingTab.js';
-import { apiService } from './services/api.service.js';
-import { wsService } from './services/websocket.service.js';
-import { healthService } from './services/health.service.js';
-import { sensingService } from './services/sensing.service.js';
-import { backendDetector } from './utils/backend-detector.js';
-import { KeyboardShortcuts } from './utils/keyboard-shortcuts.js';
-import { PerfMonitor } from './utils/perf-monitor.js';
-import { toastManager } from './utils/toast.js';
-import { ThemeToggle } from './utils/theme-toggle.js';
-import { CommandPalette } from './utils/command-palette.js';
-import { ActivityLog } from './utils/activity-log.js';
-import { DataExport } from './utils/data-export.js';
-import { FullscreenManager } from './utils/fullscreen.js';
-import { ConnectionStatus } from './utils/connection-status.js';
-import { MobileNav } from './utils/mobile-nav.js';
-import { Router } from './utils/router.js';
-import { Onboarding } from './utils/onboarding.js';
-import { IdleManager } from './utils/idle-manager.js';
-import { NotificationCenter } from './utils/notification-center.js';
-import { i18n } from './utils/i18n.js';
-import { ScreenshotTool } from './utils/screenshot.js';
-import { UptimeClock } from './utils/uptime-clock.js';
-import { QuickSettings } from './utils/quick-settings.js';
+import { TabManager } from './components/TabManager.js?v=pose-cache-clear-20260713-2';
+import { DashboardTab } from './components/DashboardTab.js?v=pose-cache-clear-20260713-2';
+import { HardwareTab } from './components/HardwareTab.js?v=pose-cache-clear-20260713-2';
+import { LiveDemoTab } from './components/LiveDemoTab.js?v=pose-cache-clear-20260713-2';
+import { SensingTab } from './components/SensingTab.js?v=pose-cache-clear-20260713-2';
+import { apiService } from './services/api.service.js?v=pose-cache-clear-20260713-2';
+import { wsService } from './services/websocket.service.js?v=pose-cache-clear-20260713-2';
+import { healthService } from './services/health.service.js?v=pose-cache-clear-20260713-2';
+import { sensingService } from './services/sensing.service.js?v=pose-cache-clear-20260713-2';
+import { backendDetector } from './utils/backend-detector.js?v=pose-cache-clear-20260713-2';
+import { KeyboardShortcuts } from './utils/keyboard-shortcuts.js?v=pose-cache-clear-20260713-2';
+import { PerfMonitor } from './utils/perf-monitor.js?v=pose-cache-clear-20260713-2';
+import { toastManager } from './utils/toast.js?v=pose-cache-clear-20260713-2';
+import { ThemeToggle } from './utils/theme-toggle.js?v=pose-cache-clear-20260713-2';
+import { CommandPalette } from './utils/command-palette.js?v=pose-cache-clear-20260713-2';
+import { ActivityLog } from './utils/activity-log.js?v=pose-cache-clear-20260713-2';
+import { DataExport } from './utils/data-export.js?v=pose-cache-clear-20260713-2';
+import { FullscreenManager } from './utils/fullscreen.js?v=pose-cache-clear-20260713-2';
+import { ConnectionStatus } from './utils/connection-status.js?v=pose-cache-clear-20260713-2';
+import { MobileNav } from './utils/mobile-nav.js?v=pose-cache-clear-20260713-2';
+import { Router } from './utils/router.js?v=pose-cache-clear-20260713-2';
+import { Onboarding } from './utils/onboarding.js?v=pose-cache-clear-20260713-2';
+import { IdleManager } from './utils/idle-manager.js?v=pose-cache-clear-20260713-2';
+import { NotificationCenter } from './utils/notification-center.js?v=pose-cache-clear-20260713-2';
+import { i18n } from './utils/i18n.js?v=pose-cache-clear-20260713-2';
+import { ScreenshotTool } from './utils/screenshot.js?v=pose-cache-clear-20260713-2';
+import { UptimeClock } from './utils/uptime-clock.js?v=pose-cache-clear-20260713-2';
+import { QuickSettings } from './utils/quick-settings.js?v=pose-cache-clear-20260713-2';
 
 class WiFiDensePoseApp {
   constructor() {
@@ -42,6 +42,10 @@ class WiFiDensePoseApp {
       
       // Set up error handling
       this.setupErrorHandling();
+
+      // Live demo code changes must reach the browser immediately; an older
+      // service worker can otherwise keep serving stale pose-rendering modules.
+      await this.clearServiceWorkerCaches();
       
       // Initialize services
       await this.initializeServices();
@@ -289,15 +293,27 @@ class WiFiDensePoseApp {
     this.onboarding.init();
   }
 
-  // Register service worker for offline capability
-  registerServiceWorker() {
-    if ('serviceWorker' in navigator) {
-      navigator.serviceWorker.register('./sw.js').then(reg => {
-        console.info('Service worker registered:', reg.scope);
-      }).catch(err => {
-        console.warn('Service worker registration failed:', err);
-      });
+  async clearServiceWorkerCaches() {
+    if (!('serviceWorker' in navigator)) return;
+
+    try {
+      const registrations = await navigator.serviceWorker.getRegistrations();
+      await Promise.all(registrations.map(reg => reg.unregister()));
+
+      if (window.caches?.keys) {
+        const keys = await caches.keys();
+        await Promise.all(keys.map(key => caches.delete(key)));
+      }
+
+      console.info('Service worker caches cleared for live pose demo');
+    } catch (error) {
+      console.warn('Service worker cache clear skipped:', error.message);
     }
+  }
+
+  // Disabled for live pose work: stale service-worker caches were hiding new UI fixes.
+  registerServiceWorker() {
+    this.clearServiceWorkerCaches();
   }
 
   // Handle tab changes

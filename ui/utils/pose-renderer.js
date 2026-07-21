@@ -59,7 +59,7 @@ export class PoseRenderer {
     // Client-side keypoint smoothing: lerp between frames to reduce jitter.
     // Maps person index → array of {x, y} for each keypoint.
     this._smoothedKeypoints = new Map();
-    this._lerpAlpha = 0.25; // 0 = frozen, 1 = instant (no smoothing)
+    this._lerpAlpha = 0.10; // 0 = frozen, 1 = instant (no smoothing)
 
     // Initialize rendering context
     this.initializeContext();
@@ -79,7 +79,13 @@ export class PoseRenderer {
     let prev = this._smoothedKeypoints.get(personIdx);
     if (!prev || prev.length !== keypoints.length) {
       // First frame or keypoint count changed — initialize
-      prev = keypoints.map(kp => ({ x: kp.x, y: kp.y, z: kp.z || 0, confidence: kp.confidence, name: kp.name }));
+      prev = keypoints.map(kp => ({
+        x: Number.isFinite(kp.x) ? kp.x : 0,
+        y: Number.isFinite(kp.y) ? kp.y : 0,
+        z: Number.isFinite(kp.z) ? kp.z : 0,
+        confidence: Number.isFinite(kp.confidence) ? kp.confidence : 0,
+        name: kp.name
+      }));
       this._smoothedKeypoints.set(personIdx, prev);
       return keypoints;
     }
@@ -87,12 +93,18 @@ export class PoseRenderer {
     const alpha = this._lerpAlpha;
     const smoothed = keypoints.map((kp, i) => ({
       ...kp,
-      x: this._lerp(prev[i].x, kp.x, alpha),
-      y: this._lerp(prev[i].y, kp.y, alpha),
+      x: Number.isFinite(kp.x) ? this._lerp(prev[i].x, kp.x, alpha) : kp.x,
+      y: Number.isFinite(kp.y) ? this._lerp(prev[i].y, kp.y, alpha) : kp.y,
     }));
 
     // Update stored positions
-    this._smoothedKeypoints.set(personIdx, smoothed.map(kp => ({ x: kp.x, y: kp.y, z: kp.z || 0, confidence: kp.confidence, name: kp.name })));
+    this._smoothedKeypoints.set(personIdx, smoothed.map(kp => ({
+      x: Number.isFinite(kp.x) ? kp.x : 0,
+      y: Number.isFinite(kp.y) ? kp.y : 0,
+      z: Number.isFinite(kp.z) ? kp.z : 0,
+      confidence: Number.isFinite(kp.confidence) ? kp.confidence : 0,
+      name: kp.name
+    })));
 
     return smoothed;
   }
@@ -123,9 +135,12 @@ export class PoseRenderer {
       
       console.log('🎨 [RENDERER] Rendering pose data:', poseData);
       
-      if (!poseData || !poseData.persons) {
+      const persons = Array.isArray(poseData?.persons) ? poseData.persons : [];
+
+      if (!poseData || !Array.isArray(poseData.persons) || persons.length === 0) {
         console.log('⚠️ [RENDERER] No pose data or persons array');
-        this.renderNoDataMessage();
+        this.renderNoDataMessage(poseData);
+        this.renderPoseModeBadge(poseData);
         return;
       }
       
@@ -148,6 +163,9 @@ export class PoseRenderer {
         default:
           this.renderSkeletonMode(poseData, metadata);
       }
+
+      this.renderPoseModeBadge(poseData);
+      this.renderPoseDiagnostics(poseData);
 
       // Render debug information if enabled
       if (this.config.showDebugInfo) {
@@ -173,16 +191,146 @@ export class PoseRenderer {
     }
   }
 
+  getPoseMode(poseData) {
+    if (poseData?.pose_mode) return poseData.pose_mode;
+    if (poseData?.pose_source === 'model_inference') return 'trained';
+    const persons = Array.isArray(poseData?.persons) ? poseData.persons : [];
+    if (!persons.length || !persons.some(person => this.isPersonRenderable(person, 'heuristic'))) {
+      return 'none';
+    }
+    return 'heuristic';
+  }
+
+  getPoseLabel(poseData) {
+    if (poseData?.pose_label) return poseData.pose_label;
+    const mode = this.getPoseMode(poseData);
+    if (mode === 'trained') return 'TRAINED POSE';
+    if (mode === 'heuristic') return 'HEURISTIC CSI POSE - NOT TRAINED';
+    return 'NO VALID POSE';
+  }
+
+  hasDrawableCoordinates(keypoint) {
+    return !!keypoint && Number.isFinite(keypoint.x) && Number.isFinite(keypoint.y);
+  }
+
+  isPersonRenderable(person, poseMode) {
+    if (!person || !Array.isArray(person.keypoints)) return false;
+    const hasCoordinates = person.keypoints.some(kp => this.hasDrawableCoordinates(kp));
+    if (!hasCoordinates) return false;
+    if (poseMode === 'heuristic') return true;
+    return person.confidence === undefined || person.confidence >= this.config.confidenceThreshold;
+  }
+
+  visualKeypointConfidence(keypoint, poseMode) {
+    if (!this.hasDrawableCoordinates(keypoint)) {
+      return 0;
+    }
+    const sourceConfidence = Number.isFinite(keypoint?.confidence) ? keypoint.confidence : 0;
+    if (sourceConfidence > this.config.keypointConfidenceThreshold) {
+      return sourceConfidence;
+    }
+    return poseMode === 'heuristic' && this.hasDrawableCoordinates(keypoint) ? 0.28 : 0;
+  }
+
+  visualPersonConfidence(person, poseMode) {
+    const sourceConfidence = Number.isFinite(person?.confidence) ? person.confidence : 0;
+    if (sourceConfidence >= this.config.confidenceThreshold) {
+      return sourceConfidence;
+    }
+    return poseMode === 'heuristic' && this.isPersonRenderable(person, poseMode) ? 0.42 : 0;
+  }
+
+  getPersonCenter(person) {
+    const valid = (person?.keypoints || []).filter(kp => this.hasDrawableCoordinates(kp));
+    if (valid.length > 0) {
+      return {
+        x: valid.reduce((sum, kp) => sum + kp.x, 0) / valid.length,
+        y: valid.reduce((sum, kp) => sum + kp.y, 0) / valid.length
+      };
+    }
+    if (person?.bbox) {
+      return {
+        x: person.bbox.x + person.bbox.width / 2,
+        y: person.bbox.y + person.bbox.height / 2
+      };
+    }
+    return { x: 320, y: 240 };
+  }
+
+  getRenderablePersons(poseData, poseMode) {
+    const persons = (poseData.persons || [])
+      .filter(person => this.isPersonRenderable(person, poseMode));
+    if (poseMode !== 'heuristic' || persons.length <= 1) {
+      return persons;
+    }
+
+    const ranked = persons
+      .map((person, index) => {
+        const center = this.getPersonCenter(person);
+        const dx = center.x - 320;
+        const dy = center.y - 260;
+        const distancePenalty = Math.sqrt(dx * dx + dy * dy) / 800;
+        const confidence = Number.isFinite(person.confidence) ? person.confidence : 0;
+        return { person, index, score: confidence - distancePenalty };
+      })
+      .sort((a, b) => b.score - a.score || a.index - b.index);
+
+    return ranked.length ? [ranked[0].person] : [];
+  }
+
+  renderPoseModeBadge(poseData) {
+    const label = this.getPoseLabel(poseData);
+    const mode = this.getPoseMode(poseData);
+    const palette = {
+      trained: { bg: 'rgba(0, 204, 136, 0.88)', fg: '#04130d' },
+      heuristic: { bg: 'rgba(245, 158, 11, 0.92)', fg: '#1b1200' },
+      none: { bg: 'rgba(148, 163, 184, 0.85)', fg: '#08111f' }
+    };
+    const colors = palette[mode] || palette.none;
+    const x = 10;
+    const y = 10;
+    this.ctx.save();
+    this.ctx.font = '12px Arial';
+    const width = Math.min(this.canvas.width - 20, this.ctx.measureText(label).width + 22);
+    this.ctx.fillStyle = colors.bg;
+    this.ctx.fillRect(x, y, width, 24);
+    this.ctx.fillStyle = colors.fg;
+    this.ctx.fillText(label, x + 11, y + 6);
+    this.ctx.restore();
+  }
+
+  renderPoseDiagnostics(poseData) {
+    const diagnostics = poseData?.diagnostics;
+    if (!diagnostics) return;
+    const lines = [
+      `Nodes: ${diagnostics.active_nodes ?? 0}`,
+      `Keypoints: ${diagnostics.drawable_keypoints ?? 0}/${diagnostics.total_keypoints ?? 0}`,
+      `Mean conf: ${((diagnostics.mean_source_confidence || 0) * 100).toFixed(1)}%`
+    ];
+    const x = 10;
+    const y = 40;
+    this.ctx.save();
+    this.ctx.font = '11px Arial';
+    this.ctx.fillStyle = 'rgba(0, 0, 0, 0.62)';
+    this.ctx.fillRect(x, y, 150, 52);
+    this.ctx.fillStyle = '#e5edf8';
+    lines.forEach((line, index) => {
+      this.ctx.fillText(line, x + 8, y + 7 + index * 14);
+    });
+    this.ctx.restore();
+  }
+
   // Skeleton rendering mode
   renderSkeletonMode(poseData, metadata) {
-    const persons = poseData.persons || [];
+    const poseMode = this.getPoseMode(poseData);
+    const persons = this.getRenderablePersons(poseData, poseMode);
     
     console.log(`🦴 [RENDERER] Skeleton mode: processing ${persons.length} persons`);
     
     persons.forEach((person, index) => {
       console.log(`👤 [RENDERER] Person ${index}:`, person);
       
-      if (person.confidence < this.config.confidenceThreshold) {
+      if (!this.isPersonRenderable(person, poseMode)) {
         console.log(`❌ [RENDERER] Skipping person ${index} - low confidence: ${person.confidence} < ${this.config.confidenceThreshold}`);
         return; // Skip low confidence detections
       }
@@ -192,12 +340,12 @@ export class PoseRenderer {
 
       // Render skeleton connections
       if (this.config.showSkeleton && smoothedKps) {
-        this.renderSkeleton(smoothedKps, person.confidence);
+        this.renderSkeleton(smoothedKps, person.confidence, { poseMode });
       }
 
       // Render keypoints
       if (this.config.showKeypoints && smoothedKps) {
-        this.renderKeypoints(smoothedKps, person.confidence);
+        this.renderKeypoints(smoothedKps, person.confidence, false, { poseMode });
       }
 
       // Render bounding box
@@ -209,7 +357,7 @@ export class PoseRenderer {
       // Render confidence score
       if (this.config.showConfidence) {
         console.log(`📊 [RENDERER] Rendering confidence score for person ${index}`);
-        this.renderConfidenceScore(person, index);
+        this.renderConfidenceScore(person, index, poseMode);
       }
     });
 
@@ -221,18 +369,19 @@ export class PoseRenderer {
 
   // Keypoints only mode — large colored dots with labels, no skeleton lines
   renderKeypointsMode(poseData, metadata) {
-    const persons = poseData.persons || [];
+    const poseMode = this.getPoseMode(poseData);
+    const persons = this.getRenderablePersons(poseData, poseMode);
 
     persons.forEach((person, index) => {
-      if (person.confidence >= this.config.confidenceThreshold && person.keypoints) {
-        this.renderKeypoints(person.keypoints, person.confidence, true);
+      if (this.isPersonRenderable(person, poseMode) && person.keypoints) {
+        this.renderKeypoints(person.keypoints, person.confidence, true, { poseMode });
 
         // Render bounding box
         if (this.config.showBoundingBox && person.bbox) {
           this.renderBoundingBox(person.bbox, person.confidence, index);
         }
         if (this.config.showConfidence) {
-          this.renderConfidenceScore(person, index);
+          this.renderConfidenceScore(person, index, poseMode);
         }
       }
     });
@@ -244,23 +393,25 @@ export class PoseRenderer {
 
   // Heatmap rendering mode — Gaussian blobs around each keypoint
   renderHeatmapMode(poseData, metadata) {
-    const persons = poseData.persons || [];
+    const poseMode = this.getPoseMode(poseData);
+    const persons = this.getRenderablePersons(poseData, poseMode);
 
     persons.forEach((person, personIdx) => {
-      if (person.confidence < this.config.confidenceThreshold || !person.keypoints) return;
+      if (!this.isPersonRenderable(person, poseMode) || !person.keypoints) return;
 
       const hue = (personIdx * 60) % 360; // different hue per person
 
       person.keypoints.forEach((kp) => {
-        if (kp.confidence <= this.config.keypointConfidenceThreshold) return;
+        const visualConfidence = this.visualKeypointConfidence(kp, poseMode);
+        if (visualConfidence <= 0) return;
 
         const cx = this.scaleX(kp.x);
         const cy = this.scaleY(kp.y);
-        const radius = 30 + kp.confidence * 20;
+        const radius = 30 + visualConfidence * 20;
 
         const grad = this.ctx.createRadialGradient(cx, cy, 0, cx, cy, radius);
-        grad.addColorStop(0, `hsla(${hue}, 100%, 55%, ${kp.confidence * 0.7})`);
-        grad.addColorStop(0.5, `hsla(${hue}, 100%, 45%, ${kp.confidence * 0.3})`);
+        grad.addColorStop(0, `hsla(${hue}, 100%, 55%, ${visualConfidence * 0.7})`);
+        grad.addColorStop(0.5, `hsla(${hue}, 100%, 45%, ${visualConfidence * 0.3})`);
         grad.addColorStop(1, `hsla(${hue}, 100%, 40%, 0)`);
 
         this.ctx.fillStyle = grad;
@@ -270,12 +421,12 @@ export class PoseRenderer {
       // Light skeleton overlay so joints are connected
       if (person.keypoints) {
         this.ctx.globalAlpha = 0.25;
-        this.renderSkeleton(person.keypoints, person.confidence);
+        this.renderSkeleton(person.keypoints, person.confidence, { poseMode });
         this.ctx.globalAlpha = 1.0;
       }
 
       if (this.config.showConfidence) {
-        this.renderConfidenceScore(person, personIdx);
+        this.renderConfidenceScore(person, personIdx, poseMode);
       }
     });
 
@@ -286,7 +437,8 @@ export class PoseRenderer {
 
   // Dense pose rendering mode — body region segmentation with filled polygons
   renderDenseMode(poseData, metadata) {
-    const persons = poseData.persons || [];
+    const poseMode = this.getPoseMode(poseData);
+    const persons = this.getRenderablePersons(poseData, poseMode);
 
     // Body part groups: [start_kp, end_kp, color]
     const bodyParts = [
@@ -299,14 +451,14 @@ export class PoseRenderer {
     ];
 
     persons.forEach((person, personIdx) => {
-      if (person.confidence < this.config.confidenceThreshold || !person.keypoints) return;
+      if (!this.isPersonRenderable(person, poseMode) || !person.keypoints) return;
 
       const kps = this._getSmoothedKeypoints(personIdx, person.keypoints);
 
       bodyParts.forEach((part) => {
         // Collect valid keypoints for this body part
         const points = part.kps
-          .filter(i => kps[i] && kps[i].confidence > this.config.keypointConfidenceThreshold)
+          .filter(i => kps[i] && this.visualKeypointConfidence(kps[i], poseMode) > 0)
           .map(i => ({ x: this.scaleX(kps[i].x), y: this.scaleY(kps[i].y) }));
 
         if (points.length < 2) return;
@@ -335,10 +487,10 @@ export class PoseRenderer {
       });
 
       // Subtle keypoint dots on top
-      this.renderKeypoints(kps, person.confidence, false);
+      this.renderKeypoints(kps, person.confidence, false, { poseMode });
 
       if (this.config.showConfidence) {
-        this.renderConfidenceScore(person, personIdx);
+        this.renderConfidenceScore(person, personIdx, poseMode);
       }
     });
 
@@ -348,14 +500,23 @@ export class PoseRenderer {
   }
 
   // Render skeleton connections
-  renderSkeleton(keypoints, confidence) {
+  renderSkeleton(keypoints, confidence, options = {}) {
+    const poseMode = options.poseMode || 'trained';
+    const personConfidence = this.visualPersonConfidence({ keypoints, confidence }, poseMode);
+    this.ctx.save();
+    if (poseMode === 'heuristic') {
+      this.ctx.setLineDash([7, 5]);
+    }
+
     this.skeletonConnections.forEach(([pointA, pointB]) => {
       const keypointA = keypoints[pointA];
       const keypointB = keypoints[pointB];
+      const confidenceA = this.visualKeypointConfidence(keypointA, poseMode);
+      const confidenceB = this.visualKeypointConfidence(keypointB, poseMode);
 
-      if (keypointA && keypointB && 
-          keypointA.confidence > this.config.keypointConfidenceThreshold &&
-          keypointB.confidence > this.config.keypointConfidenceThreshold) {
+      if (this.hasDrawableCoordinates(keypointA) && this.hasDrawableCoordinates(keypointB) &&
+          confidenceA > 0 &&
+          confidenceB > 0) {
         
         const x1 = this.scaleX(keypointA.x);
         const y1 = this.scaleY(keypointA.y);
@@ -363,7 +524,7 @@ export class PoseRenderer {
         const y2 = this.scaleY(keypointB.y);
 
         // Calculate line confidence based on both keypoints
-        const lineConfidence = (keypointA.confidence + keypointB.confidence) / 2;
+        const lineConfidence = (confidenceA + confidenceB) / 2;
         
         // Variable line width based on confidence
         const lineWidth = this.config.skeletonWidth + (lineConfidence - 0.5) * 2;
@@ -371,13 +532,15 @@ export class PoseRenderer {
         
         // Create gradient along the line
         const gradient = this.ctx.createLinearGradient(x1, y1, x2, y2);
-        const colorA = this.addAlphaToColor(this.config.skeletonColor, keypointA.confidence);
-        const colorB = this.addAlphaToColor(this.config.skeletonColor, keypointB.confidence);
+        const colorA = this.addAlphaToColor(this.config.skeletonColor, confidenceA);
+        const colorB = this.addAlphaToColor(this.config.skeletonColor, confidenceB);
         gradient.addColorStop(0, colorA);
         gradient.addColorStop(1, colorB);
         
         this.ctx.strokeStyle = gradient;
-        this.ctx.globalAlpha = Math.min(confidence * 1.2, 1.0);
+        this.ctx.globalAlpha = poseMode === 'heuristic'
+          ? Math.max(0.42, personConfidence)
+          : Math.min(personConfidence * 1.2, 1.0);
         
         // Add subtle glow for high confidence connections
         if (lineConfidence > 0.8) {
@@ -395,37 +558,40 @@ export class PoseRenderer {
       }
     });
 
+    this.ctx.restore();
     this.ctx.globalAlpha = 1.0;
   }
 
   // Render keypoints
-  renderKeypoints(keypoints, confidence, enhancedMode = false) {
+  renderKeypoints(keypoints, confidence, enhancedMode = false, options = {}) {
+    const poseMode = options.poseMode || 'trained';
     keypoints.forEach((keypoint, index) => {
-      if (keypoint.confidence > this.config.keypointConfidenceThreshold) {
+      const visualConfidence = this.visualKeypointConfidence(keypoint, poseMode);
+      if (visualConfidence > 0) {
         const x = this.scaleX(keypoint.x);
         const y = this.scaleY(keypoint.y);
         
         // Calculate radius based on confidence and keypoint importance
         const baseRadius = this.config.keypointRadius;
-        const confidenceRadius = baseRadius + (keypoint.confidence - 0.5) * 2;
+        const confidenceRadius = baseRadius + (visualConfidence - 0.5) * 2;
         const radius = Math.max(2, Math.min(8, confidenceRadius));
         
         // Set color based on keypoint type or confidence
         if (enhancedMode) {
-          this.ctx.fillStyle = this.getKeypointColor(index, keypoint.confidence);
+          this.ctx.fillStyle = this.getKeypointColor(index, visualConfidence);
         } else {
           this.ctx.fillStyle = this.config.keypointColor;
         }
         
         // Add glow effect for high confidence keypoints
-        if (keypoint.confidence > 0.8) {
+        if (visualConfidence > 0.8) {
           this.ctx.shadowColor = this.ctx.fillStyle;
           this.ctx.shadowBlur = 6;
           this.ctx.shadowOffsetX = 0;
           this.ctx.shadowOffsetY = 0;
         }
         
-        this.ctx.globalAlpha = Math.min(1.0, keypoint.confidence + 0.3);
+        this.ctx.globalAlpha = Math.min(1.0, visualConfidence + 0.3);
         
         // Draw keypoint with gradient
         const gradient = this.ctx.createRadialGradient(x, y, 0, x, y, radius);
@@ -475,7 +641,7 @@ export class PoseRenderer {
   }
 
   // Render confidence score
-  renderConfidenceScore(person, index) {
+  renderConfidenceScore(person, index, poseMode = 'trained') {
     let x, y;
     
     if (person.bbox) {
@@ -497,7 +663,11 @@ export class PoseRenderer {
     }
 
     this.ctx.fillStyle = this.config.confidenceColor;
-    this.ctx.fillText(`Conf: ${(person.confidence * 100).toFixed(1)}%`, x, y);
+    const sourceConfidence = Number.isFinite(person.confidence) ? person.confidence : 0;
+    const label = poseMode === 'heuristic'
+      ? `Heuristic, source conf: ${(sourceConfidence * 100).toFixed(1)}%`
+      : `Conf: ${(sourceConfidence * 100).toFixed(1)}%`;
+    this.ctx.fillText(label, x, y);
   }
 
   // Render zones
@@ -515,6 +685,7 @@ export class PoseRenderer {
     const debugInfo = [
       `Frame: ${poseData.frame_id || 'N/A'}`,
       `Timestamp: ${poseData.timestamp || 'N/A'}`,
+      `Mode: ${this.getPoseLabel(poseData)}`,
       `Persons: ${poseData.persons?.length || 0}`,
       `Processing: ${poseData.processing_time_ms || 0}ms`,
       `FPS: ${this.performanceMetrics.averageFps.toFixed(1)}`,
@@ -547,17 +718,18 @@ export class PoseRenderer {
   }
 
   // Render no data message
-  renderNoDataMessage() {
+  renderNoDataMessage(poseData = null) {
+    const label = this.getPoseLabel(poseData);
     this.ctx.fillStyle = '#888888';
     this.ctx.font = '16px Arial';
     this.ctx.textAlign = 'center';
     this.ctx.fillText(
-      'No pose data available', 
+      label,
       this.canvas.width / 2, 
       this.canvas.height / 2
     );
     this.ctx.fillText(
-      'Click "Demo" to see test poses', 
+      'Waiting for valid CSI pose coordinates',
       this.canvas.width / 2, 
       this.canvas.height / 2 + 25
     );

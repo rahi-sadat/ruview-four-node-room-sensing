@@ -977,6 +977,9 @@ struct AppStateInner {
     /// Instant of the last ESP32 UDP frame received (for offline detection).
     last_esp32_frame: Option<std::time::Instant>,
     tx: broadcast::Sender<String>,
+    /// Fall-like detector stream. Kept separate from `tx` so `/ws/sensing`
+    /// remains a pure sensing_update stream for node dashboards.
+    fall_tx: broadcast::Sender<String>,
     // ADR-099 D2/D3/D4: real-time CSI introspection tap. Per-frame state +
     // a parallel broadcast topic (`/ws/introspection`) running alongside
     // (not replacing) the window-aggregated `tx` / `/ws/sensing` pipeline.
@@ -1093,6 +1096,10 @@ struct AppStateInner {
     pub(crate) dedup_factor: f64,
     /// Data directory for persisting runtime config (parent of `firmware_dir`).
     pub(crate) data_dir: std::path::PathBuf,
+    /// CSI fall-like detector state. This is deliberately additive: it does not
+    /// alter pose/person inference and only publishes explicit fall_status /
+    /// fall_event messages plus REST snapshots.
+    fall_detector: FallDetector,
     /// ADR-262 P3: the live RuField surface. Holds the dedicated ed25519 signer
     /// + a bounded ring of recent signed `FieldEvent`s + the `/ws/field`
     /// broadcast topic. The governed sensing cycle calls `emit()` on it once per
@@ -1148,6 +1155,645 @@ impl AppStateInner {
             }
         }
         self.source.clone()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FallDetectorConfig {
+    enabled: bool,
+    impact_z_threshold: f64,
+    min_node_consensus: usize,
+    consensus_window_ms: u64,
+    stillness_seconds: f64,
+    cooldown_seconds: f64,
+    min_signal_quality: f64,
+    max_history_samples: usize,
+}
+
+impl FallDetectorConfig {
+    fn from_env() -> Self {
+        Self {
+            enabled: env_bool("RUVIEW_FALL_DETECTION", true),
+            impact_z_threshold: env_f64("RUVIEW_FALL_IMPACT_Z", 6.0),
+            min_node_consensus: env_usize("RUVIEW_FALL_MIN_NODE_CONSENSUS", 2).max(1),
+            consensus_window_ms: env_u64("RUVIEW_FALL_CONSENSUS_WINDOW_MS", 750),
+            stillness_seconds: env_f64("RUVIEW_FALL_STILLNESS_SECONDS", 3.0),
+            cooldown_seconds: env_f64("RUVIEW_FALL_COOLDOWN_SECONDS", 30.0),
+            min_signal_quality: env_f64("RUVIEW_FALL_MIN_SIGNAL_QUALITY", 0.25),
+            max_history_samples: env_usize("RUVIEW_FALL_HISTORY_SAMPLES", 600).max(30),
+        }
+    }
+}
+
+fn env_bool(name: &str, default: bool) -> bool {
+    match std::env::var(name) {
+        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => true,
+            "0" | "false" | "no" | "off" => false,
+            _ => default,
+        },
+        Err(_) => default,
+    }
+}
+
+fn env_f64(name: &str, default: f64) -> f64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite())
+        .unwrap_or(default)
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum FallDetectorState {
+    Normal,
+    ImpactCandidate,
+    PostImpactObservation,
+    FallLikeConfirmed,
+    Recovery,
+    Cooldown,
+}
+
+impl FallDetectorState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Normal => "NORMAL",
+            Self::ImpactCandidate => "IMPACT_CANDIDATE",
+            Self::PostImpactObservation => "POST_IMPACT_OBSERVATION",
+            Self::FallLikeConfirmed => "FALL_LIKE_CONFIRMED",
+            Self::Recovery => "RECOVERY",
+            Self::Cooldown => "COOLDOWN",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FallEvent {
+    id: u64,
+    start_time: f64,
+    confirmation_time: f64,
+    timestamp: f64,
+    label: String,
+    state: String,
+    confidence: f64,
+    impact_score: f64,
+    stillness_score: f64,
+    pose_confirmation: String,
+    reason: String,
+    agreeing_nodes: Vec<u8>,
+    active_nodes: usize,
+    source: String,
+    acknowledged: bool,
+    evidence: serde_json::Value,
+}
+
+#[derive(Debug, Clone)]
+struct FallNodeSample {
+    timestamp: f64,
+    motion: f64,
+    variance: f64,
+    spectral: f64,
+    signal_quality: f64,
+    edge_fall_flag: bool,
+}
+
+#[derive(Debug, Clone)]
+struct FallImpactMark {
+    node_id: u8,
+    timestamp: f64,
+    score: f64,
+    edge_fall_flag: bool,
+}
+
+struct FallDetector {
+    config: FallDetectorConfig,
+    state: FallDetectorState,
+    node_history: HashMap<u8, VecDeque<FallNodeSample>>,
+    recent_impacts: VecDeque<FallImpactMark>,
+    events: VecDeque<FallEvent>,
+    next_event_id: u64,
+    candidate_started_at: Option<f64>,
+    candidate_impact_score: f64,
+    candidate_agreeing_nodes: Vec<u8>,
+    candidate_active_nodes: usize,
+    last_event_at: Option<f64>,
+    cooldown_until: Option<f64>,
+    last_impact_score: f64,
+    last_stillness_score: f64,
+    last_active_nodes: usize,
+    last_agreeing_nodes: Vec<u8>,
+    last_reason: String,
+    event_log_path: PathBuf,
+}
+
+impl FallDetector {
+    fn new(data_dir: PathBuf) -> Self {
+        Self {
+            config: FallDetectorConfig::from_env(),
+            state: FallDetectorState::Normal,
+            node_history: HashMap::new(),
+            recent_impacts: VecDeque::new(),
+            events: VecDeque::with_capacity(128),
+            next_event_id: 1,
+            candidate_started_at: None,
+            candidate_impact_score: 0.0,
+            candidate_agreeing_nodes: vec![],
+            candidate_active_nodes: 0,
+            last_event_at: None,
+            cooldown_until: None,
+            last_impact_score: 0.0,
+            last_stillness_score: 0.0,
+            last_active_nodes: 0,
+            last_agreeing_nodes: vec![],
+            last_reason: "waiting_for_csi".to_string(),
+            event_log_path: data_dir.join("fall_events.jsonl"),
+        }
+    }
+
+    fn observe_update(
+        &mut self,
+        update: &SensingUpdate,
+        edge_vitals: Option<&Esp32VitalsPacket>,
+    ) -> Option<FallEvent> {
+        if !self.config.enabled {
+            self.state = FallDetectorState::Normal;
+            self.last_reason = "disabled".to_string();
+            return None;
+        }
+
+        let now = update.timestamp;
+        self.advance_cooldown(now);
+
+        let measurements = self.measurements_from_update(update, edge_vitals);
+        self.last_active_nodes = measurements.len();
+        if measurements.is_empty() {
+            self.last_reason = "no_node_features".to_string();
+            self.last_impact_score = 0.0;
+            self.last_stillness_score = 0.0;
+            self.last_agreeing_nodes.clear();
+            return None;
+        }
+
+        let mut best_impact = 0.0_f64;
+        for (node_id, sample) in measurements {
+            let impact_score = self.impact_score_for_sample(node_id, &sample);
+            best_impact = best_impact.max(impact_score);
+            if sample.signal_quality >= self.config.min_signal_quality
+                && update.classification.presence
+                && impact_score >= self.config.impact_z_threshold
+            {
+                self.recent_impacts.push_back(FallImpactMark {
+                    node_id,
+                    timestamp: sample.timestamp,
+                    score: impact_score,
+                    edge_fall_flag: sample.edge_fall_flag,
+                });
+            }
+
+            let history = self.node_history.entry(node_id).or_default();
+            if history.len() >= self.config.max_history_samples {
+                history.pop_front();
+            }
+            history.push_back(sample);
+        }
+
+        self.last_impact_score = best_impact;
+        self.prune_impacts(now);
+        let agreeing_nodes = self.agreeing_nodes(now);
+        self.last_agreeing_nodes = agreeing_nodes.clone();
+        let consensus_met = agreeing_nodes.len() >= self.config.min_node_consensus;
+
+        if matches!(self.state, FallDetectorState::Cooldown) {
+            self.last_reason = "cooldown".to_string();
+            self.last_stillness_score = self.compute_stillness(now);
+            return None;
+        }
+
+        if consensus_met && !matches!(self.state, FallDetectorState::FallLikeConfirmed) {
+            self.state = FallDetectorState::PostImpactObservation;
+            self.candidate_started_at = Some(now);
+            self.candidate_impact_score = self
+                .recent_impacts
+                .iter()
+                .filter(|m| agreeing_nodes.contains(&m.node_id))
+                .map(|m| m.score)
+                .fold(best_impact, f64::max);
+            self.candidate_agreeing_nodes = agreeing_nodes.clone();
+            self.candidate_active_nodes = self.last_active_nodes;
+            self.last_reason = "multi_node_impact_candidate".to_string();
+        } else if best_impact >= self.config.impact_z_threshold
+            && self.state == FallDetectorState::Normal
+        {
+            self.state = FallDetectorState::ImpactCandidate;
+            self.candidate_started_at = Some(now);
+            self.last_reason = "impact_without_consensus".to_string();
+        }
+
+        self.last_stillness_score = self.compute_stillness(now);
+
+        if self.state == FallDetectorState::PostImpactObservation {
+            let observation_age = self
+                .candidate_started_at
+                .map(|started| now - started)
+                .unwrap_or(0.0);
+            if observation_age >= self.config.stillness_seconds {
+                if self.last_stillness_score >= 0.55 && update.classification.presence {
+                    return self.confirm_event(update, now);
+                }
+                self.state = FallDetectorState::Recovery;
+                self.last_reason = "post_impact_motion_continued".to_string();
+            }
+        } else if self.state == FallDetectorState::ImpactCandidate {
+            let age = self
+                .candidate_started_at
+                .map(|started| now - started)
+                .unwrap_or(0.0);
+            if age > (self.config.consensus_window_ms as f64 / 1000.0) {
+                self.state = FallDetectorState::Recovery;
+                self.last_reason = "consensus_timeout".to_string();
+            }
+        } else if self.state == FallDetectorState::Recovery {
+            if self.last_impact_score < self.config.impact_z_threshold * 0.5 {
+                self.state = FallDetectorState::Normal;
+                self.candidate_started_at = None;
+                self.last_reason = "recovered".to_string();
+            }
+        }
+
+        None
+    }
+
+    fn measurements_from_update(
+        &self,
+        update: &SensingUpdate,
+        edge_vitals: Option<&Esp32VitalsPacket>,
+    ) -> Vec<(u8, FallNodeSample)> {
+        let mut out = vec![];
+        if let Some(nodes) = &update.node_features {
+            for node in nodes.iter().filter(|n| !n.stale) {
+                out.push((
+                    node.node_id,
+                    FallNodeSample::from_features(
+                        update.timestamp,
+                        &node.features,
+                        node.classification.confidence,
+                        edge_vitals
+                            .is_some_and(|v| v.node_id == node.node_id && v.fall_detected),
+                    ),
+                ));
+            }
+        }
+
+        if out.is_empty() {
+            let node_id = update.nodes.first().map(|n| n.node_id).unwrap_or(0);
+            let edge_flag = edge_vitals.is_some_and(|v| v.fall_detected);
+            let quality = update
+                .signal_quality_score
+                .unwrap_or(update.classification.confidence)
+                .clamp(0.0, 1.0);
+            out.push((
+                node_id,
+                FallNodeSample::from_features(update.timestamp, &update.features, quality, edge_flag),
+            ));
+        }
+        out
+    }
+
+    fn impact_score_for_sample(&self, node_id: u8, sample: &FallNodeSample) -> f64 {
+        let history = self.node_history.get(&node_id);
+        let motion_z = robust_z(sample.motion, history.into_iter().flatten().map(|s| s.motion));
+        let variance_z =
+            robust_z(sample.variance, history.into_iter().flatten().map(|s| s.variance));
+        let spectral_z =
+            robust_z(sample.spectral, history.into_iter().flatten().map(|s| s.spectral));
+
+        let edge_score = if sample.edge_fall_flag {
+            self.config.impact_z_threshold + 2.0
+        } else {
+            0.0
+        };
+
+        motion_z
+            .max(variance_z * 0.8)
+            .max(spectral_z * 0.6)
+            .max(edge_score)
+            .clamp(0.0, 99.0)
+    }
+
+    fn prune_impacts(&mut self, now: f64) {
+        let window = self.config.consensus_window_ms as f64 / 1000.0;
+        while self
+            .recent_impacts
+            .front()
+            .is_some_and(|m| now - m.timestamp > window)
+        {
+            self.recent_impacts.pop_front();
+        }
+    }
+
+    fn agreeing_nodes(&self, now: f64) -> Vec<u8> {
+        let window = self.config.consensus_window_ms as f64 / 1000.0;
+        let mut by_node: HashMap<u8, f64> = HashMap::new();
+        for mark in self
+            .recent_impacts
+            .iter()
+            .filter(|m| now - m.timestamp <= window)
+        {
+            by_node
+                .entry(mark.node_id)
+                .and_modify(|score| *score = (*score).max(mark.score))
+                .or_insert(mark.score);
+        }
+        let mut nodes: Vec<u8> = by_node.keys().copied().collect();
+        nodes.sort_unstable();
+        nodes
+    }
+
+    fn compute_stillness(&self, now: f64) -> f64 {
+        let Some(started) = self.candidate_started_at else {
+            return 0.0;
+        };
+        let window_start = (now - self.config.stillness_seconds).max(started);
+        let mut recent = vec![];
+        let mut baseline = vec![];
+        for history in self.node_history.values() {
+            for sample in history {
+                if sample.timestamp >= window_start {
+                    recent.push(sample.motion);
+                } else if sample.timestamp < started {
+                    baseline.push(sample.motion);
+                }
+            }
+        }
+        if recent.is_empty() {
+            return 0.0;
+        }
+
+        let recent_avg = recent.iter().sum::<f64>() / recent.len() as f64;
+        let baseline_motion = median(&mut baseline).unwrap_or(1.0).max(0.25);
+        (1.0 - (recent_avg / (baseline_motion * 3.0)).clamp(0.0, 1.0)).clamp(0.0, 1.0)
+    }
+
+    fn confirm_event(&mut self, update: &SensingUpdate, now: f64) -> Option<FallEvent> {
+        if self
+            .last_event_at
+            .is_some_and(|t| now - t < self.config.cooldown_seconds)
+        {
+            self.state = FallDetectorState::Cooldown;
+            self.cooldown_until = Some(now + self.config.cooldown_seconds);
+            self.last_reason = "duplicate_suppressed_by_cooldown".to_string();
+            return None;
+        }
+
+        let confidence = self.current_confidence();
+        let event = FallEvent {
+            id: self.next_event_id,
+            start_time: self.candidate_started_at.unwrap_or(now),
+            confirmation_time: now,
+            timestamp: now,
+            label: "FALL-LIKE EVENT".to_string(),
+            state: FallDetectorState::FallLikeConfirmed.as_str().to_string(),
+            confidence,
+            impact_score: self.candidate_impact_score.max(self.last_impact_score),
+            stillness_score: self.last_stillness_score,
+            pose_confirmation: if update
+                .pose_keypoints
+                .as_ref()
+                .is_some_and(|kps| !kps.is_empty())
+            {
+                "available_not_decisive".to_string()
+            } else {
+                "unavailable".to_string()
+            },
+            reason: "multi_node_impact_plus_post_impact_stillness".to_string(),
+            agreeing_nodes: self.candidate_agreeing_nodes.clone(),
+            active_nodes: self.candidate_active_nodes,
+            source: update.source.clone(),
+            acknowledged: false,
+            evidence: serde_json::json!({
+                "algorithm": "CSI impact plus post-impact stillness",
+                "edge_fall_flag_seen": self.recent_impacts.iter().any(|m| m.edge_fall_flag),
+                "motion_level": &update.classification.motion_level,
+                "presence": update.classification.presence,
+                "medical_or_emergency_claim": false
+            }),
+        };
+        self.next_event_id += 1;
+        self.last_event_at = Some(now);
+        self.cooldown_until = Some(now + self.config.cooldown_seconds);
+        self.state = FallDetectorState::FallLikeConfirmed;
+        self.last_reason = "fall_like_confirmed".to_string();
+        self.events.push_back(event.clone());
+        while self.events.len() > 128 {
+            self.events.pop_front();
+        }
+        self.persist_event(&event);
+        Some(event)
+    }
+
+    fn advance_cooldown(&mut self, now: f64) {
+        if self.state == FallDetectorState::FallLikeConfirmed {
+            if self.last_event_at.is_some_and(|t| now - t > 2.0) {
+                self.state = FallDetectorState::Cooldown;
+            }
+        }
+        if self.state == FallDetectorState::Cooldown
+            && self.cooldown_until.is_some_and(|until| now >= until)
+        {
+            self.state = FallDetectorState::Normal;
+            self.candidate_started_at = None;
+            self.candidate_agreeing_nodes.clear();
+            self.last_reason = "cooldown_complete".to_string();
+        }
+    }
+
+    fn current_confidence(&self) -> f64 {
+        let impact = (self.candidate_impact_score.max(self.last_impact_score)
+            / self.config.impact_z_threshold)
+            .clamp(0.0, 1.0);
+        let consensus = if self.config.min_node_consensus == 0 {
+            1.0
+        } else {
+            (self.candidate_agreeing_nodes.len().max(self.last_agreeing_nodes.len()) as f64
+                / self.config.min_node_consensus as f64)
+                .clamp(0.0, 1.0)
+        };
+        (impact * 0.45 + self.last_stillness_score * 0.35 + consensus * 0.20)
+            .clamp(0.0, 0.95)
+    }
+
+    fn acknowledge_latest(&mut self) {
+        for event in self.events.iter_mut().rev() {
+            if !event.acknowledged {
+                event.acknowledged = true;
+                break;
+            }
+        }
+    }
+
+    fn status_json(&self, source: &str, model_loaded: bool) -> serde_json::Value {
+        let last_event = self.events.back().cloned();
+        let acknowledged = last_event.as_ref().map(|e| e.acknowledged).unwrap_or(true);
+        let cooldown_remaining_seconds = self
+            .cooldown_until
+            .map(|until| (until - now_seconds()).max(0.0))
+            .unwrap_or(0.0);
+        serde_json::json!({
+            "type": "fall_status",
+            "label": if self.state == FallDetectorState::FallLikeConfirmed { "FALL-LIKE EVENT" } else { "NO FALL-LIKE EVENT" },
+            "state": self.state.as_str(),
+            "fall_like": self.state == FallDetectorState::FallLikeConfirmed,
+            "timestamp": now_seconds(),
+            "enabled": self.config.enabled,
+            "mode": "fall_like_detector",
+            "source": source,
+            "confidence": self.current_confidence(),
+            "impact_score": self.last_impact_score,
+            "impact_z_threshold": self.config.impact_z_threshold,
+            "stillness_score": self.last_stillness_score,
+            "active_nodes": self.last_active_nodes,
+            "agreeing_nodes": &self.last_agreeing_nodes,
+            "min_node_consensus": self.config.min_node_consensus,
+            "cooldown_remaining_seconds": cooldown_remaining_seconds,
+            "acknowledged": acknowledged,
+            "pose_confirmation": if model_loaded { "available_when_trained_keypoints_present" } else { "unavailable" },
+            "last_event": last_event,
+            "events_count": self.events.len(),
+            "reason": &self.last_reason,
+            "model_loaded": model_loaded,
+            "medical_or_emergency_claim": false,
+            "config": &self.config,
+        })
+    }
+
+    fn events_json(&self) -> serde_json::Value {
+        let events: Vec<FallEvent> = self.events.iter().rev().cloned().collect();
+        serde_json::json!({
+            "events": events,
+            "total": self.events.len(),
+            "label": "FALL-LIKE EVENTS",
+            "medical_or_emergency_claim": false,
+        })
+    }
+
+    fn persist_event(&self, event: &FallEvent) {
+        if let Some(parent) = self.event_log_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.event_log_path)
+        {
+            if let Ok(line) = serde_json::to_string(event) {
+                let _ = std::io::Write::write_all(&mut file, line.as_bytes());
+                let _ = std::io::Write::write_all(&mut file, b"\n");
+            }
+        }
+    }
+}
+
+impl FallNodeSample {
+    fn from_features(
+        timestamp: f64,
+        features: &FeatureInfo,
+        signal_quality: f64,
+        edge_fall_flag: bool,
+    ) -> Self {
+        Self {
+            timestamp,
+            motion: features.motion_band_power.max(0.0),
+            variance: features.variance.max(0.0),
+            spectral: features.spectral_power.max(0.0),
+            signal_quality: signal_quality.clamp(0.0, 1.0),
+            edge_fall_flag,
+        }
+    }
+}
+
+fn robust_z<I>(value: f64, history: I) -> f64
+where
+    I: IntoIterator<Item = f64>,
+{
+    let mut values: Vec<f64> = history
+        .into_iter()
+        .filter(|v| v.is_finite())
+        .collect();
+    if values.len() < 8 {
+        return 0.0;
+    }
+    let mut sorted = values.clone();
+    let Some(med) = median(&mut sorted) else {
+        return 0.0;
+    };
+    let mut deviations: Vec<f64> = values.into_iter().map(|v| (v - med).abs()).collect();
+    let mad = median(&mut deviations).unwrap_or(0.0);
+    let fallback_scale = (med.abs() * 0.10).max(0.05);
+    let scale = (1.4826 * mad).max(fallback_scale);
+    ((value - med) / scale).max(0.0)
+}
+
+fn median(values: &mut [f64]) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mid = values.len() / 2;
+    if values.len() % 2 == 0 {
+        Some((values[mid - 1] + values[mid]) * 0.5)
+    } else {
+        Some(values[mid])
+    }
+}
+
+fn now_seconds() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+fn observe_fall_detector(
+    s: &mut AppStateInner,
+    update: &SensingUpdate,
+    edge_vitals: Option<&Esp32VitalsPacket>,
+) {
+    let source = s.effective_source();
+    let model_loaded = s.model_loaded;
+    let event = s.fall_detector.observe_update(update, edge_vitals);
+    let status = s.fall_detector.status_json(&source, model_loaded);
+    let _ = s.fall_tx.send(
+        serde_json::json!({
+            "type": "fall_status",
+            "timestamp": update.timestamp,
+            "payload": status,
+        })
+        .to_string(),
+    );
+    if let Some(event) = event {
+        let _ = s.fall_tx.send(
+            serde_json::json!({
+                "type": "fall_event",
+                "timestamp": event.timestamp,
+                "payload": event,
+            })
+            .to_string(),
+        );
     }
 }
 
@@ -2601,6 +3247,7 @@ async fn windows_wifi_task(state: SharedState, tick_ms: u64) {
         }
         // #1050: attach real signal_field-peak positions to each person.
         attach_field_positions(&mut update);
+        observe_fall_detector(&mut s, &update, None);
 
         if let Ok(json) = serde_json::to_string(&update) {
             let _ = s.tx.send(json);
@@ -2756,6 +3403,7 @@ async fn windows_wifi_fallback_tick(state: &SharedState, seq: u32) {
     }
     // #1050: attach real signal_field-peak positions to each person.
     attach_field_positions(&mut update);
+    observe_fall_detector(&mut s, &update, None);
 
     if let Ok(json) = serde_json::to_string(&update) {
         let _ = s.tx.send(json);
@@ -3135,6 +3783,50 @@ async fn api_introspection_snapshot(State(state): State<SharedState>) -> impl In
 
 // ── Pose WebSocket handler (sends pose_data messages for Live Demo) ──────────
 
+async fn ws_fall_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<SharedState>,
+) -> impl IntoResponse {
+    ws.on_upgrade(|socket| handle_ws_fall_client(socket, state))
+}
+
+async fn handle_ws_fall_client(mut socket: WebSocket, state: SharedState) {
+    let mut rx = {
+        let s = state.read().await;
+        s.fall_tx.subscribe()
+    };
+
+    info!("WebSocket client connected (fall)");
+
+    loop {
+        tokio::select! {
+            msg = rx.recv() => {
+                match msg {
+                    Ok(json) => {
+                        if socket.send(Message::Text(json)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::debug!("WS fall client lagged by {n} frames, skipping");
+                        continue;
+                    }
+                    Err(_) => break,
+                }
+            }
+            msg = socket.recv() => {
+                match msg {
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(Message::Pong(_))) => {}
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    info!("WebSocket client disconnected (fall)");
+}
+
 async fn ws_pose_handler(
     ws: WebSocketUpgrade,
     State(state): State<SharedState>,
@@ -3146,6 +3838,10 @@ async fn handle_ws_pose_client(mut socket: WebSocket, state: SharedState) {
     let mut rx = {
         let s = state.read().await;
         s.tx.subscribe()
+    };
+    let mut fall_rx = {
+        let s = state.read().await;
+        s.fall_tx.subscribe()
     };
 
     info!("WebSocket client connected (pose)");
@@ -3159,23 +3855,49 @@ async fn handle_ws_pose_client(mut socket: WebSocket, state: SharedState) {
 
     loop {
         tokio::select! {
+            msg = fall_rx.recv() => {
+                match msg {
+                    Ok(json) => {
+                        if socket.send(Message::Text(json)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::debug!("WS pose fall stream lagged by {n} frames, skipping");
+                        continue;
+                    }
+                    Err(_) => break,
+                }
+            }
             msg = rx.recv() => {
                 match msg {
                     Ok(json) => {
+                        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&json) {
+                            if matches!(
+                                value.get("type").and_then(|t| t.as_str()),
+                                Some("fall_status" | "fall_event")
+                            ) {
+                                if socket.send(Message::Text(json)).await.is_err() {
+                                    break;
+                                }
+                                continue;
+                            }
+                        }
                         // Parse the sensing update and convert to pose format
                         if let Ok(sensing) = serde_json::from_str::<SensingUpdate>(&json) {
                             if sensing.msg_type == "sensing_update" {
                                 // Determine pose estimation mode for the UI indicator.
                                 // "model_inference"    — a trained RVF model is loaded.
                                 // "signal_derived"     — keypoints estimated from raw CSI features.
-                                let model_loaded = {
+                                let (model_loaded, fall_status) = {
                                     let s = state.read().await;
-                                    s.model_loaded
-                                };
-                                let pose_source = if model_loaded {
-                                    "model_inference"
-                                } else {
-                                    "signal_derived"
+                                    (
+                                        s.model_loaded,
+                                        s.fall_detector.status_json(
+                                            &s.effective_source(),
+                                            s.model_loaded,
+                                        ),
+                                    )
                                 };
 
                                 let persons = if model_loaded {
@@ -3218,6 +3940,16 @@ async fn handle_ws_pose_client(mut socket: WebSocket, state: SharedState) {
                                     // Prefer tracked persons from broadcast if available
                                     sensing.persons.clone().unwrap_or_else(|| derive_pose_from_sensing(&sensing))
                                 };
+                                let pose_mode =
+                                    pose_mode_for(Some(&sensing), &persons, model_loaded);
+                                let pose_source = if pose_mode == "trained" {
+                                    "model_inference"
+                                } else {
+                                    "signal_derived"
+                                };
+                                let pose_diagnostics =
+                                    pose_diagnostics_json(Some(&sensing), &persons, model_loaded, 0);
+                                let estimated_persons = persons.len();
 
                                 let pose_msg = serde_json::json!({
                                     "type": "pose_data",
@@ -3231,6 +3963,10 @@ async fn handle_ws_pose_client(mut socket: WebSocket, state: SharedState) {
                                         "activity": sensing.classification.motion_level,
                                         // pose_source tells the UI which estimation mode is active.
                                         "pose_source": pose_source,
+                                        "pose_mode": pose_mode,
+                                        "pose_label": pose_label_for(pose_mode),
+                                        "diagnostics": pose_diagnostics,
+                                        "fall_status": fall_status,
                                         "metadata": {
                                             "frame_id": format!("rust_frame_{}", sensing.tick),
                                             "processing_time_ms": 1,
@@ -3239,7 +3975,7 @@ async fn handle_ws_pose_client(mut socket: WebSocket, state: SharedState) {
                                             "signal_strength": sensing.features.mean_rssi,
                                             "motion_band_power": sensing.features.motion_band_power,
                                             "breathing_band_power": sensing.features.breathing_band_power,
-                                            "estimated_persons": persons.len(),
+                                            "estimated_persons": estimated_persons,
                                         }
                                     }
                                 });
@@ -4323,6 +5059,121 @@ async fn api_info(State(state): State<SharedState>) -> Json<serde_json::Value> {
     }))
 }
 
+fn pose_keypoint_has_coordinates(kp: &PoseKeypoint) -> bool {
+    kp.x.is_finite() && kp.y.is_finite() && kp.z.is_finite()
+}
+
+fn person_has_drawable_pose(person: &PersonDetection) -> bool {
+    person.keypoints.iter().any(pose_keypoint_has_coordinates)
+}
+
+fn pose_mode_for(
+    update: Option<&SensingUpdate>,
+    persons: &[PersonDetection],
+    model_loaded: bool,
+) -> &'static str {
+    if persons.is_empty() || !persons.iter().any(person_has_drawable_pose) {
+        return "none";
+    }
+    if model_loaded
+        && update
+            .and_then(|u| u.pose_keypoints.as_ref())
+            .is_some_and(|kps| !kps.is_empty())
+    {
+        "trained"
+    } else {
+        "heuristic"
+    }
+}
+
+fn pose_label_for(mode: &str) -> &'static str {
+    match mode {
+        "trained" => "TRAINED POSE",
+        "heuristic" => "HEURISTIC CSI POSE - NOT TRAINED",
+        _ => "NO VALID POSE",
+    }
+}
+
+fn pose_frame_window_len(s: &AppStateInner) -> usize {
+    s.frame_history
+        .len()
+        .max(s.node_states.values().map(|n| n.frame_history.len()).max().unwrap_or(0))
+}
+
+fn active_nodes_from_update(update: Option<&SensingUpdate>) -> usize {
+    let Some(update) = update else {
+        return 0;
+    };
+    update
+        .node_features
+        .as_ref()
+        .map(|nodes| nodes.iter().filter(|n| !n.stale).count())
+        .filter(|count| *count > 0)
+        .unwrap_or(update.nodes.len())
+}
+
+fn pose_diagnostics_json(
+    update: Option<&SensingUpdate>,
+    persons: &[PersonDetection],
+    model_loaded: bool,
+    input_window_frames: usize,
+) -> serde_json::Value {
+    let mut total_keypoints = 0usize;
+    let mut drawable_keypoints = 0usize;
+    let mut positive_conf_keypoints = 0usize;
+    let mut confidence_sum = 0.0_f64;
+    let mut confidence_count = 0usize;
+
+    for person in persons {
+        if person.confidence.is_finite() {
+            confidence_sum += person.confidence.clamp(0.0, 1.0);
+            confidence_count += 1;
+        }
+        for kp in &person.keypoints {
+            total_keypoints += 1;
+            if pose_keypoint_has_coordinates(kp) {
+                drawable_keypoints += 1;
+            }
+            if kp.confidence.is_finite() && kp.confidence > 0.0 {
+                positive_conf_keypoints += 1;
+                confidence_sum += kp.confidence.clamp(0.0, 1.0);
+                confidence_count += 1;
+            }
+        }
+    }
+
+    let mode = pose_mode_for(update, persons, model_loaded);
+    let mean_confidence = if confidence_count > 0 {
+        confidence_sum / confidence_count as f64
+    } else {
+        0.0
+    };
+    let reason = match mode {
+        "trained" => "model_keypoints_present",
+        "heuristic" if positive_conf_keypoints == 0 => "heuristic_coordinates_without_confidence",
+        "heuristic" => "signal_derived_heuristic_pose",
+        _ => "no_drawable_pose",
+    };
+
+    serde_json::json!({
+        "pose_mode": mode,
+        "pose_label": pose_label_for(mode),
+        "model_loaded": model_loaded,
+        "model_keypoints_present": update
+            .and_then(|u| u.pose_keypoints.as_ref())
+            .is_some_and(|kps| !kps.is_empty()),
+        "active_nodes": active_nodes_from_update(update),
+        "input_window_frames": input_window_frames,
+        "input_window_ready": input_window_frames >= 8,
+        "persons": persons.len(),
+        "total_keypoints": total_keypoints,
+        "drawable_keypoints": drawable_keypoints,
+        "positive_confidence_keypoints": positive_conf_keypoints,
+        "mean_source_confidence": mean_confidence,
+        "reason": reason,
+    })
+}
+
 async fn pose_current(State(state): State<SharedState>) -> Json<serde_json::Value> {
     let s = state.read().await;
     let persons = match &s.latest_update {
@@ -4332,11 +5183,53 @@ async fn pose_current(State(state): State<SharedState>) -> Json<serde_json::Valu
             .unwrap_or_else(|| derive_pose_from_sensing(update)),
         None => vec![],
     };
+    let update = s.latest_update.as_ref();
+    let pose_mode = pose_mode_for(update, &persons, s.model_loaded);
+    let diagnostics = pose_diagnostics_json(update, &persons, s.model_loaded, pose_frame_window_len(&s));
+    let total_persons = persons.len();
+    let active_model_id = s.active_model_id.clone();
     Json(serde_json::json!({
         "timestamp": chrono::Utc::now().timestamp_millis() as f64 / 1000.0,
         "persons": persons,
-        "total_persons": persons.len(),
+        "total_persons": total_persons,
+        "pose_mode": pose_mode,
+        "pose_label": pose_label_for(pose_mode),
+        "diagnostics": diagnostics,
+        "model": {
+            "loaded": s.model_loaded,
+            "active_model_id": active_model_id,
+            "trained_keypoints_present": update
+                .and_then(|u| u.pose_keypoints.as_ref())
+                .is_some_and(|kps| !kps.is_empty()),
+        },
+        "warning": if pose_mode == "heuristic" {
+            Some("HEURISTIC CSI POSE - NOT TRAINED")
+        } else {
+            None
+        },
         "source": s.effective_source(),
+    }))
+}
+
+async fn fall_status(State(state): State<SharedState>) -> Json<serde_json::Value> {
+    let s = state.read().await;
+    Json(s.fall_detector.status_json(&s.effective_source(), s.model_loaded))
+}
+
+async fn fall_events(State(state): State<SharedState>) -> Json<serde_json::Value> {
+    let s = state.read().await;
+    Json(s.fall_detector.events_json())
+}
+
+async fn fall_acknowledge(State(state): State<SharedState>) -> Json<serde_json::Value> {
+    let mut s = state.write().await;
+    s.fall_detector.acknowledge_latest();
+    let source = s.effective_source();
+    let model_loaded = s.model_loaded;
+    let status = s.fall_detector.status_json(&source, model_loaded);
+    Json(serde_json::json!({
+        "status": "ok",
+        "fall_status": status,
     }))
 }
 
@@ -4501,6 +5394,14 @@ fn effective_models_dir() -> PathBuf {
     PathBuf::from(std::env::var("MODELS_DIR").unwrap_or_else(|_| "data/models".to_string()))
 }
 
+/// Return the effective recordings directory, respecting `RECORDINGS_DIR`.
+/// Defaults to `data/recordings`, which is `/app/data/recordings` in Docker.
+fn effective_recordings_dir() -> PathBuf {
+    PathBuf::from(
+        std::env::var("RECORDINGS_DIR").unwrap_or_else(|_| "data/recordings".to_string()),
+    )
+}
+
 /// Scan the models directory for `.rvf` files and return metadata.
 /// Respects the `MODELS_DIR` environment variable.
 fn scan_model_files() -> Vec<serde_json::Value> {
@@ -4592,7 +5493,7 @@ async fn start_recording(
         .unwrap_or_else(|| format!("rec_{}", chrono_timestamp()));
 
     // Create the recording file
-    let rec_path = PathBuf::from("data/recordings").join(format!("{}.jsonl", id));
+    let rec_path = effective_recordings_dir().join(format!("{}.jsonl", id));
     let file = match std::fs::File::create(&rec_path) {
         Ok(f) => f,
         Err(e) => {
@@ -4718,9 +5619,13 @@ async fn delete_recording(
     if safe_id.is_empty() || safe_id != id {
         return Json(serde_json::json!({ "error": "invalid recording id", "success": false }));
     }
-    let path = PathBuf::from("data/recordings").join(format!("{}.jsonl", safe_id));
-    if path.exists() {
-        if let Err(e) = std::fs::remove_file(&path) {
+    let dir = effective_recordings_dir();
+    let candidates = [
+        dir.join(format!("{}.jsonl", safe_id)),
+        dir.join(format!("{}.csi.jsonl", safe_id)),
+    ];
+    if let Some(path) = candidates.iter().find(|path| path.exists()) {
+        if let Err(e) = std::fs::remove_file(path) {
             // ADR-080 #2: log the OS error (incl. path) server-side only.
             return error_response::internal_error_json("recording delete", e);
         }
@@ -4734,19 +5639,35 @@ async fn delete_recording(
     }
 }
 
-/// Scan `data/recordings/` for `.jsonl` files and return metadata.
+/// Count JSONL records without loading the whole capture into memory.
+fn count_recording_lines(path: &std::path::Path) -> usize {
+    let Ok(file) = std::fs::File::open(path) else {
+        return 0;
+    };
+    let reader = std::io::BufReader::new(file);
+    std::io::BufRead::lines(reader)
+        .filter(|line| line.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false))
+        .count()
+}
+
+fn recording_id_from_path(path: &std::path::Path) -> String {
+    let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("unknown");
+    file_name
+        .strip_suffix(".csi.jsonl")
+        .or_else(|| file_name.strip_suffix(".jsonl"))
+        .unwrap_or(file_name)
+        .to_string()
+}
+
+/// Scan recordings for `.jsonl` files and return metadata.
 fn scan_recording_files() -> Vec<serde_json::Value> {
-    let dir = PathBuf::from("data/recordings");
+    let dir = effective_recordings_dir();
     let mut recordings = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&dir) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
-                let name = path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("unknown")
-                    .to_string();
+                let name = recording_id_from_path(&path);
                 let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
                 let modified = entry
                     .metadata()
@@ -4755,22 +5676,30 @@ fn scan_recording_files() -> Vec<serde_json::Value> {
                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
-                // Count lines (frames) — approximate for large files
-                let frame_count = std::fs::read_to_string(&path)
-                    .map(|s| s.lines().count())
-                    .unwrap_or(0);
+                let frame_count = count_recording_lines(&path);
+                let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
                 recordings.push(serde_json::json!({
                     "id": name,
                     "name": name,
                     "path": path.display().to_string(),
+                    "file_name": file_name,
+                    "file_size_bytes": size,
                     "size_bytes": size,
+                    "frame_count": frame_count,
                     "frames": frame_count,
                     "modified_epoch": modified,
                     "status": "completed",
+                    "format": if file_name.ends_with(".csi.jsonl") { "csi_frame" } else { "sensing_update" },
                 }));
             }
         }
     }
+    recordings.sort_by(|a, b| {
+        b.get("modified_epoch")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+            .cmp(&a.get("modified_epoch").and_then(|v| v.as_u64()).unwrap_or(0))
+    });
     recordings
 }
 
@@ -4828,7 +5757,7 @@ async fn train_stop(State(state): State<SharedState>) -> Json<serde_json::Value>
 
 /// POST /api/v1/adaptive/train — train the adaptive classifier from recordings.
 async fn adaptive_train(State(state): State<SharedState>) -> Json<serde_json::Value> {
-    let rec_dir = PathBuf::from("data/recordings");
+    let rec_dir = effective_recordings_dir();
     eprintln!("=== Adaptive Classifier Training ===");
     match adaptive_classifier::train_from_recordings(&rec_dir) {
         Ok(model) => {
@@ -5636,6 +6565,7 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                     }
                     // #1050: attach real signal_field-peak positions to each person.
                     attach_field_positions(&mut update);
+                    observe_fall_detector(&mut s, &update, Some(&vitals));
 
                     if let Ok(json) = serde_json::to_string(&update) {
                         let _ = s.tx.send(json);
@@ -6068,6 +6998,8 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                     }
                     // #1050: attach real signal_field-peak positions to each person.
                     attach_field_positions(&mut update);
+                    let edge_vitals = s.edge_vitals.clone();
+                    observe_fall_detector(&mut s, &update, edge_vitals.as_ref());
 
                     if let Ok(json) = serde_json::to_string(&update) {
                         let _ = s.tx.send(json);
@@ -6255,6 +7187,7 @@ async fn simulated_data_task(state: SharedState, tick_ms: u64) {
         }
         // #1050: attach real signal_field-peak positions to each person.
         attach_field_positions(&mut update);
+        observe_fall_detector(&mut s, &update, None);
 
         if update.classification.presence {
             s.total_detections += 1;
@@ -7355,7 +8288,7 @@ async fn main() {
     // Ensure data directories exist for models and recordings
     let models_dir = effective_models_dir();
     let _ = std::fs::create_dir_all(&models_dir);
-    let _ = std::fs::create_dir_all("data/recordings");
+    let _ = std::fs::create_dir_all(effective_recordings_dir());
 
     // Discover model and recording files on startup
     let initial_models = scan_model_files();
@@ -7396,6 +8329,7 @@ async fn main() {
     };
 
     let (tx, _) = broadcast::channel::<String>(256);
+    let (fall_tx, _) = broadcast::channel::<String>(64);
     // ADR-099: parallel broadcast for the per-frame introspection snapshot stream
     // consumed by `/ws/introspection`. Same ring size as `tx` (256) — slow
     // clients drop oldest, identical backpressure shape.
@@ -7470,6 +8404,7 @@ async fn main() {
         source: source.into(),
         last_esp32_frame: None,
         tx,
+        fall_tx,
         intro: wifi_densepose_sensing_server::introspection::IntrospectionState::new(),
         intro_tx,
         total_detections: 0,
@@ -7569,6 +8504,7 @@ async fn main() {
         // ADR-044 §5.3: runtime-configurable dedup factor (persisted).
         dedup_factor: runtime_config.dedup_factor,
         data_dir: data_dir.clone(),
+        fall_detector: FallDetector::new(data_dir.clone()),
         field_surface: field_surface.clone(),
     }));
 
@@ -7642,6 +8578,7 @@ async fn main() {
     let ws_state = state.clone();
     let ws_app = Router::new()
         .route("/ws/sensing", get(ws_sensing_handler))
+        .route("/ws/fall", get(ws_fall_handler))
         .route("/health", get(health))
         .with_state(ws_state)
         // ADR-262 P3: additive `/ws/field` (+ `/api/field`) on the WS port too,
@@ -7706,11 +8643,16 @@ async fn main() {
         .route("/api/v1/pose/current", get(pose_current))
         .route("/api/v1/pose/stats", get(pose_stats))
         .route("/api/v1/pose/zones/summary", get(pose_zones_summary))
+        // Fall-like detector endpoints (demo-safe CSI state machine)
+        .route("/api/v1/fall/status", get(fall_status))
+        .route("/api/v1/fall/events", get(fall_events))
+        .route("/api/v1/fall/acknowledge", post(fall_acknowledge))
         // Stream endpoints
         .route("/api/v1/stream/status", get(stream_status))
         .route("/api/v1/stream/pose", get(ws_pose_handler))
         // Sensing WebSocket on the HTTP port so the UI can reach it without a second port
         .route("/ws/sensing", get(ws_sensing_handler))
+        .route("/ws/fall", get(ws_fall_handler))
         // ADR-099: real-time introspection — per-frame attractor + DTW snapshot.
         .route("/ws/introspection", get(ws_introspection_handler))
         .route(
@@ -8696,5 +9638,184 @@ mod observatory_persons_field_position_tests {
         let p = &update.persons.as_ref().unwrap()[0];
         assert_eq!(p.position, [0.0, 0.0, 0.0], "no peak → default origin, not fabricated coords");
         assert!((p.motion_score - 55.0).abs() < 1e-6, "motion_score stays real");
+    }
+}
+
+#[cfg(test)]
+mod pose_fall_live_demo_tests {
+    use super::*;
+
+    fn empty_signal_field() -> SignalField {
+        SignalField {
+            grid_size: [4, 1, 4],
+            values: vec![0.0; 16],
+        }
+    }
+
+    fn node_info(node_id: u8) -> NodeInfo {
+        NodeInfo {
+            node_id,
+            rssi_dbm: -50.0,
+            position: [0.0, 0.0, 0.0],
+            amplitude: vec![],
+            subcarrier_count: 0,
+            sync: None,
+        }
+    }
+
+    fn features(motion: f64, variance: f64, spectral: f64) -> FeatureInfo {
+        FeatureInfo {
+            mean_rssi: -50.0,
+            variance,
+            motion_band_power: motion,
+            breathing_band_power: 0.0,
+            dominant_freq_hz: 0.0,
+            change_points: 0,
+            spectral_power: spectral,
+        }
+    }
+
+    fn fall_update(timestamp: f64, per_node_motion: &[(u8, f64)], presence: bool) -> SensingUpdate {
+        let mean_motion = if per_node_motion.is_empty() {
+            0.0
+        } else {
+            per_node_motion.iter().map(|(_, m)| *m).sum::<f64>() / per_node_motion.len() as f64
+        };
+        let node_features = per_node_motion
+            .iter()
+            .map(|(node_id, motion)| PerNodeFeatureInfo {
+                node_id: *node_id,
+                features: features(*motion, *motion, *motion),
+                classification: ClassificationInfo {
+                    motion_level: if presence { "moving".to_string() } else { "absent".to_string() },
+                    presence,
+                    confidence: if presence { 0.9 } else { 0.0 },
+                },
+                rssi_dbm: -50.0,
+                last_seen_ms: 0,
+                frame_rate_hz: 20.0,
+                stale: false,
+                novelty_score: None,
+            })
+            .collect::<Vec<_>>();
+
+        SensingUpdate {
+            msg_type: "sensing_update".to_string(),
+            timestamp,
+            source: "test".to_string(),
+            tick: (timestamp * 10.0) as u64,
+            nodes: per_node_motion.iter().map(|(id, _)| node_info(*id)).collect(),
+            features: features(mean_motion, mean_motion, mean_motion),
+            classification: ClassificationInfo {
+                motion_level: if presence { "moving".to_string() } else { "absent".to_string() },
+                presence,
+                confidence: if presence { 0.9 } else { 0.0 },
+            },
+            signal_field: empty_signal_field(),
+            vital_signs: None,
+            enhanced_motion: None,
+            enhanced_breathing: None,
+            posture: None,
+            signal_quality_score: Some(0.9),
+            quality_verdict: None,
+            bssid_count: None,
+            pose_keypoints: None,
+            model_status: None,
+            persons: None,
+            estimated_persons: None,
+            node_features: Some(node_features),
+        }
+    }
+
+    fn detector_for_test() -> FallDetector {
+        let mut detector = FallDetector::new(PathBuf::from("target/pose-fall-test-data"));
+        detector.config.impact_z_threshold = 6.0;
+        detector.config.min_node_consensus = 2;
+        detector.config.consensus_window_ms = 750;
+        detector.config.stillness_seconds = 0.5;
+        detector.config.cooldown_seconds = 10.0;
+        detector
+    }
+
+    #[test]
+    fn pose_mode_labels_empty_heuristic_and_trained_outputs() {
+        let mut update = fall_update(1.0, &[(1, 2.0), (2, 2.0)], true);
+        assert_eq!(pose_mode_for(Some(&update), &[], false), "none");
+        assert_eq!(pose_label_for("none"), "NO VALID POSE");
+
+        let heuristic_person = PersonDetection {
+            id: 1,
+            confidence: 0.0,
+            keypoints: vec![PoseKeypoint {
+                name: "nose".to_string(),
+                x: 320.0,
+                y: 180.0,
+                z: 0.0,
+                confidence: 0.0,
+            }],
+            bbox: BoundingBox {
+                x: 300.0,
+                y: 150.0,
+                width: 40.0,
+                height: 100.0,
+            },
+            zone: "zone_1".to_string(),
+            position: [0.0, 0.0, 0.0],
+            motion_score: 0.0,
+            pose: None,
+        };
+        assert_eq!(
+            pose_mode_for(Some(&update), &[heuristic_person.clone()], false),
+            "heuristic"
+        );
+        assert_eq!(pose_label_for("heuristic"), "HEURISTIC CSI POSE - NOT TRAINED");
+
+        update.pose_keypoints = Some(vec![[320.0, 180.0, 0.0, 0.7]]);
+        assert_eq!(pose_mode_for(Some(&update), &[heuristic_person], true), "trained");
+        assert_eq!(pose_label_for("trained"), "TRAINED POSE");
+    }
+
+    #[test]
+    fn fall_detector_does_not_confirm_single_node_spike() {
+        let mut detector = detector_for_test();
+        for i in 0..10 {
+            let update = fall_update(i as f64 * 0.1, &[(1, 1.0)], true);
+            assert!(detector.observe_update(&update, None).is_none());
+        }
+        let impact = fall_update(1.1, &[(1, 40.0)], true);
+        assert!(detector.observe_update(&impact, None).is_none());
+        for i in 0..8 {
+            let update = fall_update(1.2 + i as f64 * 0.1, &[(1, 0.5)], true);
+            assert!(detector.observe_update(&update, None).is_none());
+        }
+        assert_ne!(detector.state, FallDetectorState::FallLikeConfirmed);
+        assert!(detector.events.is_empty());
+    }
+
+    #[test]
+    fn fall_detector_confirms_multi_node_impact_then_stillness() {
+        let mut detector = detector_for_test();
+        for i in 0..10 {
+            let update = fall_update(i as f64 * 0.1, &[(1, 1.0), (2, 1.0)], true);
+            assert!(detector.observe_update(&update, None).is_none());
+        }
+
+        let impact = fall_update(1.1, &[(1, 45.0), (2, 42.0)], true);
+        assert!(detector.observe_update(&impact, None).is_none());
+
+        let mut confirmed = None;
+        for i in 0..8 {
+            let update = fall_update(1.2 + i as f64 * 0.1, &[(1, 0.4), (2, 0.5)], true);
+            confirmed = detector.observe_update(&update, None);
+            if confirmed.is_some() {
+                break;
+            }
+        }
+
+        let event = confirmed.expect("multi-node impact plus stillness should confirm");
+        assert_eq!(event.label, "FALL-LIKE EVENT");
+        assert_eq!(event.state, "FALL_LIKE_CONFIRMED");
+        assert_eq!(event.agreeing_nodes, vec![1, 2]);
+        assert!(event.confidence > 0.5, "confidence={}", event.confidence);
     }
 }

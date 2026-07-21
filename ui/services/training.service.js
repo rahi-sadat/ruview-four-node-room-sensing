@@ -159,7 +159,8 @@ export class TrainingService {
       return this.progressSocket;
     }
 
-    const url = buildWsUrl('/ws/train/progress');
+    const token = apiService.getAuthToken();
+    const url = buildWsUrl('/ws/train/progress', token ? { token } : {});
     this.logger.info('Connecting progress stream', { url });
 
     const ws = new WebSocket(url);

@@ -36,7 +36,11 @@ services:
       # Mount a host directory and set this to make models visible:
       #   volumes: ["/path/to/models:/app/models"]
       #   MODELS_DIR=/app/models
-      - MODELS_DIR=${MODELS_DIR:-data/models}
+      - MODELS_DIR=/app/models
+      - RECORDINGS_DIR=/app/data/recordings
+    volumes:
+      - ${DATA_DIR:-../data}:/app/data
+      - ${HOST_MODELS_DIR:-../models}:/app/models
     # No explicit command needed — docker-entrypoint.sh uses CSI_SOURCE.
     # Override with: command: ["--source", "esp32", "--tick-ms", "500"]
 

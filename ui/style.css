@@ -822,6 +822,86 @@ body {
   margin-bottom: 0;
 }
 
+.project-team-page {
+  max-width: 900px;
+  margin: 0 auto;
+}
+
+.dashboard-team-panel {
+  margin: var(--space-32) auto;
+  text-align: left;
+}
+
+.dashboard-team-heading {
+  text-align: center;
+  margin-bottom: var(--space-16);
+}
+
+.dashboard-team-heading h3 {
+  margin-top: var(--space-8);
+  margin-bottom: 0;
+}
+
+.dashboard-team-link {
+  display: inline-flex;
+  margin-top: var(--space-16);
+  color: var(--color-primary);
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-medium);
+  text-decoration: none;
+}
+
+.dashboard-team-link:hover {
+  color: var(--color-primary-hover);
+  text-decoration: underline;
+}
+
+.project-team-header {
+  text-align: center;
+  margin-bottom: var(--space-24);
+}
+
+.project-team-kicker,
+.project-member-label {
+  display: inline-block;
+  color: var(--color-primary);
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-semibold);
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
+.project-team-header h2 {
+  margin-top: var(--space-8);
+  margin-bottom: 0;
+}
+
+.project-team-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: var(--space-20);
+}
+
+.project-member-card {
+  background-color: var(--color-surface);
+  border: 1px solid var(--color-card-border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-sm);
+  padding: var(--space-24);
+}
+
+.project-member-card h3 {
+  margin-top: var(--space-12);
+  margin-bottom: var(--space-8);
+  font-weight: var(--font-weight-semibold);
+}
+
+.project-member-card p {
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-md);
+  margin-bottom: 0;
+}
+
 .system-stats {
   display: flex;
   justify-content: space-around;

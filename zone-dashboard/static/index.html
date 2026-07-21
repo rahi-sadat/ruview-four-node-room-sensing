@@ -1,0 +1,352 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>RuView Zone Dashboard</title>
+<style>
+:root{
+  color-scheme:dark;--bg:#071019;--panel:#101d29;--panel2:#142636;
+  --border:#264155;--text:#edf5fa;--muted:#91a7b8;--cyan:#68d7ff;
+  --green:#4dd477;--amber:#f3bd48;--red:#ff6268;--blue:#6699ff
+}
+*{box-sizing:border-box} body{margin:0;background:radial-gradient(circle at top,#123047,#071019 44%);
+font-family:Inter,Segoe UI,system-ui,sans-serif;color:var(--text);min-height:100vh}
+header{padding:20px 26px 10px;display:flex;justify-content:space-between;gap:18px;align-items:flex-end}
+h1{font-size:24px;margin:0}.sub{font-size:12px;color:var(--muted);margin-top:5px}
+.pill{border:1px solid var(--border);background:var(--panel2);border-radius:999px;padding:8px 12px;font-size:12px}
+main{padding:14px 26px 28px;display:grid;grid-template-columns:minmax(500px,1.25fr) minmax(350px,.75fr);gap:16px}
+.panel{background:rgba(16,29,41,.94);border:1px solid var(--border);border-radius:16px;overflow:hidden;box-shadow:0 18px 45px #0005}
+.title{padding:13px 15px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;color:var(--muted);font-size:13px}
+.map{height:510px;position:relative;margin:18px;border:1px solid #35536a;border-radius:14px;
+background:linear-gradient(#ffffff08 1px,transparent 1px),linear-gradient(90deg,#ffffff08 1px,transparent 1px),#0a1721;
+background-size:38px 38px;overflow:hidden}
+.nodeMarker{position:absolute;width:72px;height:72px;border-radius:50%;transform:translate(-50%,-50%);
+display:flex;flex-direction:column;align-items:center;justify-content:center;border:2px solid #39566b;background:#122536;font-size:12px}
+.nodeMarker.online{border-color:var(--green);box-shadow:0 0 20px #4dd47755}.nodeMarker .tiny{color:var(--muted);font-size:9px;margin-top:3px}
+.person{position:absolute;width:48px;height:48px;border-radius:50%;transform:translate(-50%,-50%);
+background:#68d7ff22;border:2px solid var(--cyan);box-shadow:0 0 30px #68d7ff88;display:none}
+.person:after{content:"";position:absolute;left:50%;top:50%;width:12px;height:12px;background:#fff;border-radius:50%;transform:translate(-50%,-50%)}
+.zoneBanner{position:absolute;left:50%;top:18px;transform:translateX(-50%);padding:10px 15px;border-radius:999px;
+background:#071019dd;border:1px solid var(--cyan);font-weight:700;min-width:230px;text-align:center}
+.side{display:flex;flex-direction:column;gap:16px}.metrics{padding:13px;display:grid;grid-template-columns:1fr 1fr;gap:9px}
+.metric{border:1px solid var(--border);background:var(--panel2);padding:11px;border-radius:11px;min-height:73px}
+.label{font-size:10px;color:var(--muted)}.value{font-size:18px;font-weight:700;margin-top:5px}.full{grid-column:1/-1}
+.bars{padding:13px}.barRow{margin-bottom:11px}.barHead{display:flex;justify-content:space-between;font-size:12px;margin-bottom:5px}
+.track{height:10px;border-radius:999px;background:#071019;overflow:hidden}.fill{height:100%;width:0;background:linear-gradient(90deg,var(--blue),var(--cyan));transition:width .25s}
+.cal{padding:14px}.steps{display:grid;gap:8px}.step{display:grid;grid-template-columns:1fr auto auto;gap:8px;align-items:center;
+background:var(--panel2);border:1px solid var(--border);padding:9px 10px;border-radius:10px;font-size:12px}
+button,a.button{border:1px solid #3b617b;background:#183248;color:var(--text);padding:8px 10px;border-radius:8px;cursor:pointer;text-decoration:none;font-size:13px}
+button:hover,a.button:hover{filter:brightness(1.18)}button.primary,a.button.primary{background:#135a78;border-color:#2394bf}button.danger{background:#5b2024;border-color:#9c333a}
+button:disabled{opacity:.45;cursor:not-allowed}.progress{padding:10px 0;color:var(--amber);font-size:12px;min-height:34px}
+.alert{margin:13px;padding:12px;border-radius:10px;background:var(--panel2);border:1px solid var(--border);font-size:12px}
+.alert.red{background:#ff626819;border-color:var(--red)}.notice{padding:0 14px 14px;color:var(--muted);font-size:11px;line-height:1.5}
+.demoBtns{display:flex;gap:8px;padding:0 14px 14px;flex-wrap:wrap}.good{color:var(--green)}.warn{color:var(--amber)}.bad{color:var(--red)}
+input{width:76px;border:1px solid var(--border);background:#071019;color:var(--text);border-radius:8px;padding:7px 8px}
+.recordBox{padding:14px;display:grid;gap:12px}.recordSettings{display:grid;grid-template-columns:repeat(3,minmax(84px,1fr));gap:9px}
+.field{display:flex;align-items:center;justify-content:space-between;gap:8px;border:1px solid var(--border);background:var(--panel2);border-radius:10px;padding:9px 10px;font-size:12px;color:var(--muted)}
+.recordRows{display:grid;gap:8px}.sessionRow{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;align-items:center;background:var(--panel2);border:1px solid var(--border);border-radius:10px;padding:10px}
+.sessionRow.active{border-color:var(--cyan);box-shadow:0 0 18px #68d7ff22}.sessionMeta{color:var(--muted);font-size:11px;margin-top:4px}.actions{display:flex;gap:7px;align-items:center}
+.recordTimer{font-weight:700;color:var(--cyan)}.poseActions{display:flex;gap:8px;padding:14px;flex-wrap:wrap}.poseHint{padding:0 14px 14px;color:var(--muted);font-size:11px}
+@media(max-width:980px){main{grid-template-columns:1fr}.map{height:430px}}
+@media(max-width:520px){.recordSettings{grid-template-columns:1fr}.sessionRow{grid-template-columns:1fr}.actions{justify-content:flex-start}}
+</style>
+</head>
+<body>
+<header>
+<div><h1>Four-Node WiFi CSI Zone Dashboard</h1><div class="sub">Room-specific approximate location: strongest learned CSI disturbance pattern</div></div>
+<div id="statusPill" class="pill">Connecting…</div>
+</header>
+<main>
+<section class="panel">
+<div class="title"><span>Approximate room zone</span><span id="clock">—</span></div>
+<div id="roomMap" class="map">
+  <div id="zoneBanner" class="zoneBanner">Waiting for calibration</div>
+  <div id="person" class="person"></div>
+</div>
+<div class="notice">The marker represents a learned coarse zone, not an exact x-y coordinate. One-person operation is recommended.</div>
+</section>
+
+<aside class="side">
+<section class="panel">
+<div class="title"><span>Live sensing</span><span id="source">LIVE</span></div>
+<div class="metrics">
+ <div class="metric"><div class="label">ZONE</div><div id="zone" class="value">—</div></div>
+ <div class="metric"><div class="label">CONFIDENCE</div><div id="confidence" class="value">—</div></div>
+ <div class="metric"><div class="label">PRESENCE</div><div id="presence" class="value">—</div></div>
+ <div class="metric"><div class="label">MOTION</div><div id="motion" class="value">—</div></div>
+ <div class="metric full"><div class="label">STRONGEST AFFECTED LINK</div><div id="strongest" class="value">—</div></div>
+</div>
+<div id="fallAlert" class="alert">No fall-like pattern</div>
+<div id="error" class="notice bad"></div>
+</section>
+
+<section class="panel">
+<div class="title"><span>Per-node disturbance</span><span id="nodeCount">0 / 4</span></div>
+<div id="bars" class="bars"></div>
+</section>
+
+<section class="panel">
+<div class="title"><span>CSI recording sessions</span><span id="recordPhase">Ready</span></div>
+<div class="recordBox">
+  <div class="recordSettings">
+    <label class="field"><span>Wait</span><input id="prepareSeconds" type="number" min="0" max="300" value="10"></label>
+    <label class="field"><span>Record</span><input id="durationSeconds" type="number" min="1" max="3600" value="30"></label>
+    <label class="field"><span>Trial</span><input id="trialNumber" type="number" min="1" max="99" value="1"></label>
+  </div>
+  <div id="recordingStatus" class="progress">Select a session to begin.</div>
+  <div id="recordRows" class="recordRows"></div>
+</div>
+</section>
+
+<section class="panel">
+<div class="title"><span>Custom pose dashboard</span><span id="poseStatus">Not checked</span></div>
+<div class="poseActions">
+  <a class="button primary" href="/pose" target="_blank" rel="noreferrer">Open pose dashboard</a>
+  <button onclick="checkPose()">Check pose</button>
+</div>
+<div id="poseHint" class="poseHint">Path: /pose</div>
+</section>
+
+<section class="panel">
+<div class="title"><span>Calibration wizard</span><span id="modelStatus">Model not ready</span></div>
+<div class="cal">
+<div class="steps" id="steps"></div>
+<div id="calProgress" class="progress"></div>
+<button id="trainBtn" class="primary" onclick="trainModel()">Train zone model</button>
+<button id="cancelCalBtn" class="danger" onclick="cancelCalibration()">Stop calibration</button>
+<button class="danger" onclick="resetAll()">Reset calibration</button>
+</div>
+<div id="validation" class="notice"></div>
+<div class="demoBtns">
+<button onclick="startDemo()">Record showcase</button>
+<button onclick="stopDemo()">Stop recording</button>
+</div>
+</section>
+</aside>
+</main>
+
+<script>
+const zonePositions={EMPTY:[50,50],NODE_1:[12,14],NODE_2:[88,14],NODE_3:[12,86],NODE_4:[88,86],CENTER:[50,52]};
+const labels=[
+ ["EMPTY","Empty room",30],
+ ["NODE_1","Stand/move near Node 1",45],
+ ["NODE_2","Stand/move near Node 2",45],
+ ["NODE_3","Stand/move near Node 3",45],
+ ["NODE_4","Stand/move near Node 4",45],
+ ["CENTER","Stand/move at center",45]
+];
+const recordingSessions=[
+ ["empty","Empty room"],
+ ["zone1","Zone 1 / Near Node 1"],
+ ["zone2","Zone 2 / Near Node 2"],
+ ["zone3","Zone 3 / Near Node 3"],
+ ["zone4","Zone 4 / Near Node 4"],
+ ["center","Center"]
+];
+let config=null,lastState=null,lastRecordingState=null;
+const sessionResults={};
+
+function makeUI(){
+ const map=document.getElementById("roomMap");
+ for(let i=1;i<=4;i++){
+   const pos=zonePositions["NODE_"+i],n=document.createElement("div");
+   n.id="mapNode"+i;n.className="nodeMarker";n.style.left=pos[0]+"%";n.style.top=pos[1]+"%";
+   n.innerHTML=`<b>Node ${i}</b><span class="tiny">OFFLINE</span>`;map.appendChild(n);
+ }
+ const steps=document.getElementById("steps");
+ labels.forEach(([id,text,dur])=>{
+   const row=document.createElement("div");row.className="step";
+   row.innerHTML=`<span>${text}</span><span id="count_${id}">0 samples</span>
+   <button id="btn_${id}" onclick="calibrate('${id}',${dur})">${dur}s</button>`;steps.appendChild(row);
+ });
+}
+makeUI();
+
+function makeRecordingUI(){
+ const root=document.getElementById("recordRows");
+ recordingSessions.forEach(([id,text])=>{
+   const row=document.createElement("div");row.className="sessionRow";row.id=`recRow_${id}`;
+   row.innerHTML=`<div><b>${text}</b><div id="recMeta_${id}" class="sessionMeta">Ready</div></div>
+   <div class="actions"><button id="recStart_${id}" class="primary" onclick="startZoneSession('${id}')">Start</button>
+   <button id="recStop_${id}" class="danger" onclick="stopZoneSession('${id}')" disabled>Stop</button></div>`;
+   root.appendChild(row);
+ });
+}
+makeRecordingUI();
+
+async function post(url,body={}){
+ const r=await fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+ const data=await r.json();if(!r.ok)throw new Error(data.detail||"Request failed");return data;
+}
+async function calibrate(label,duration){
+ try{await post("/api/calibration/start",{label,duration_seconds:duration});}catch(e){alert(e.message);}
+}
+async function cancelCalibration(){
+ try{await post("/api/calibration/cancel");}catch(e){alert(e.message);}
+}
+async function trainModel(){
+ try{const d=await post("/api/model/train");alert("Model trained. Time-block consistency: "+(d.validation.time_block_accuracy*100).toFixed(1)+"%");}
+ catch(e){alert(e.message);}
+}
+async function resetAll(){
+ if(!confirm("Delete the room calibration and zone model?"))return;
+ await post("/api/model/reset");location.reload();
+}
+async function startDemo(){try{const d=await post("/api/demo/start",{name:"showcase"});alert("Recording: "+d.path);}catch(e){alert(e.message)}}
+async function stopDemo(){const d=await post("/api/demo/stop");alert(d.path?"Saved: "+d.path:"No active recording");}
+
+function numericValue(id,fallback,min,max){
+ const input=document.getElementById(id);
+ const value=Number(input.value);
+ if(!Number.isFinite(value))return fallback;
+ return Math.max(min,Math.min(max,Math.round(value)));
+}
+function formatSeconds(value){
+ const total=Math.max(0,Math.ceil(Number(value)||0));
+ const minutes=Math.floor(total/60),seconds=total%60;
+ return minutes?`${minutes}:${String(seconds).padStart(2,"0")}`:`${seconds}s`;
+}
+async function startZoneSession(session){
+ const body={
+   session,
+   trial:numericValue("trialNumber",1,1,99),
+   prepare_seconds:numericValue("prepareSeconds",10,0,300),
+   duration_seconds:numericValue("durationSeconds",30,1,3600)
+ };
+ try{
+   const data=await post("/api/record-zone/start",body);
+   updateRecording(data.recording);
+ }catch(e){alert(e.message);}
+}
+async function stopZoneSession(){
+ try{
+   const data=await post("/api/record-zone/stop");
+   updateRecording(data.recording);
+ }catch(e){alert(e.message);}
+}
+async function fetchRecordingStatus(){
+ try{
+   const response=await fetch("/api/record-zone/status");
+   if(response.ok)updateRecording(await response.json());
+ }catch{}
+}
+function updateRecording(r){
+ if(!r)return;
+ lastRecordingState=r;
+ const phaseNames={idle:"Ready",preparing:"Waiting",starting:"Starting",recording:"Recording",stopping:"Stopping",completed:"Saved",stopped:"Stopped",error:"Error"};
+ const phase=phaseNames[r.phase]||r.phase||"Ready";
+ document.getElementById("recordPhase").textContent=phase;
+ const status=document.getElementById("recordingStatus");
+ status.textContent=r.message||"Ready.";
+ if(r.phase==="preparing"||r.phase==="recording"){
+   const timer=document.createElement("span");
+   timer.className="recordTimer";
+   timer.textContent=formatSeconds(r.remaining_seconds);
+   status.append(document.createTextNode(r.phase==="preparing"?" · starts in ":" · "));
+   status.append(timer);
+   if(r.phase==="recording")status.append(document.createTextNode(" left"));
+ }
+ if(r.session&&["completed","stopped","error"].includes(r.phase)){
+   sessionResults[r.session]=r.phase==="error"?(r.error||"Error"):r.message;
+ }
+ recordingSessions.forEach(([id])=>{
+   const row=document.getElementById(`recRow_${id}`);
+   const start=document.getElementById(`recStart_${id}`);
+   const stop=document.getElementById(`recStop_${id}`);
+   const meta=document.getElementById(`recMeta_${id}`);
+   const current=r.active&&r.session===id;
+   row.className=`sessionRow ${current?"active":""}`;
+   start.disabled=Boolean(r.active);
+   stop.disabled=!current;
+   if(current){
+     meta.textContent=r.phase==="preparing"
+       ? `Waiting ${formatSeconds(r.remaining_seconds)}`
+       : r.phase==="recording"
+       ? `Recording ${formatSeconds(r.remaining_seconds)}`
+       : phase;
+   }else{
+     meta.textContent=sessionResults[id]||"Ready";
+   }
+ });
+ if(r.phase==="completed"&&r.saved){
+   const trial=document.getElementById("trialNumber");
+   if(Number(trial.value)===Number(r.trial))trial.value=String(Math.min(99,Number(r.trial)+1));
+ }
+}
+async function checkPose(){
+ const status=document.getElementById("poseStatus");
+ const hint=document.getElementById("poseHint");
+ status.textContent="Checking";
+ try{
+   const response=await fetch("/pose/health");
+   const data=await response.json();
+   if(!response.ok)throw new Error(data.detail||"Unavailable");
+   status.textContent=data.model_loaded?"Ready":"Degraded";
+   hint.textContent=data.model_error||`Mode: ${data.mode||"live"}`;
+ }catch(e){
+   status.textContent="Offline";
+   hint.textContent=e.message;
+ }
+}
+
+function update(s){
+ lastState=s;document.getElementById("clock").textContent=new Date(s.timestamp*1000).toLocaleTimeString();
+ const online=s.nodes.filter(n=>n.online).length;
+ document.getElementById("statusPill").textContent=s.ruview_connected?`RuView connected · ${online}/4 nodes`:"RuView disconnected";
+ document.getElementById("source").textContent=s.source.toUpperCase();
+ document.getElementById("zone").textContent=s.zone_display;
+ document.getElementById("confidence").textContent=(s.confidence*100).toFixed(0)+"%";
+ document.getElementById("presence").textContent=s.presence?"PRESENT":"NOT CONFIRMED";
+ document.getElementById("motion").textContent=s.motion;
+ document.getElementById("strongest").textContent=s.strongest_node?`Router ↔ Node ${s.strongest_node}`:"—";
+ document.getElementById("nodeCount").textContent=`${online} / 4`;
+ document.getElementById("error").textContent=s.error||"";
+ document.getElementById("modelStatus").textContent=s.calibration.model_ready?"Model ready":"Model not ready";
+ document.getElementById("modelStatus").className=s.calibration.model_ready?"good":"warn";
+
+ const banner=document.getElementById("zoneBanner");banner.textContent=s.zone_display+" · "+(s.confidence*100).toFixed(0)+"%";
+ const person=document.getElementById("person"),pos=zonePositions[s.zone];
+ if(pos && s.zone!=="EMPTY"){person.style.display="block";person.style.left=pos[0]+"%";person.style.top=pos[1]+"%";}
+ else person.style.display="none";
+
+ const bars=document.getElementById("bars");bars.innerHTML="";
+ const maxScore=Math.max(1,...s.nodes.map(n=>n.disturbance));
+ s.nodes.forEach(n=>{
+   const row=document.createElement("div");row.className="barRow";
+   row.innerHTML=`<div class="barHead"><span>Node ${n.node_id} · ${n.online?"ONLINE":"OFFLINE"} · ${n.rssi??"—"} dBm</span>
+   <span>${n.disturbance.toFixed(2)}</span></div><div class="track"><div class="fill" style="width:${Math.min(100,n.disturbance/maxScore*100)}%"></div></div>`;
+   bars.appendChild(row);
+   const marker=document.getElementById("mapNode"+n.node_id);
+   marker.className="nodeMarker "+(n.online?"online":"");
+   marker.querySelector(".tiny").textContent=n.online?`${n.rssi??"—"} dBm · ${n.subcarriers??"—"} SC`:"OFFLINE";
+ });
+
+ for(const [label] of labels){
+   const count=s.calibration.completed_labels[label]||0;
+   document.getElementById("count_"+label).textContent=count+" samples";
+   document.getElementById("btn_"+label).disabled=s.calibration.active || (label!=="EMPTY"&&!s.calibration.baseline_ready);
+ }
+ document.getElementById("trainBtn").disabled=s.calibration.active;
+ document.getElementById("cancelCalBtn").disabled=!s.calibration.active;
+ const cp=document.getElementById("calProgress");
+ cp.textContent=s.calibration.active?`Collecting ${s.calibration.label}: ${s.calibration.remaining_seconds.toFixed(0)}s remaining · ${s.calibration.samples_current} samples`:"";
+
+ if(s.zone_recording)updateRecording(s.zone_recording);
+ const fa=document.getElementById("fallAlert");fa.textContent=s.fall_reason;fa.className="alert "+(s.fall_like?"red":"");
+ const v=s.calibration.validation||{};
+ document.getElementById("validation").textContent=v.time_block_accuracy!=null?
+   `Same-room time-block consistency: ${(v.time_block_accuracy*100).toFixed(1)}%. ${v.note}`:"";
+}
+let ws;
+function connect(){
+ const proto=location.protocol==="https:"?"wss:":"ws:";ws=new WebSocket(`${proto}//${location.host}/ws`);
+ ws.onopen=()=>ws.send("ready");ws.onmessage=e=>update(JSON.parse(e.data));ws.onclose=()=>setTimeout(connect,1200);
+}
+connect();
+fetchRecordingStatus();
+setInterval(fetchRecordingStatus,500);
+checkPose();
+</script>
+</body>
+</html>

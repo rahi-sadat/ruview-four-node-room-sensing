@@ -11,7 +11,7 @@ export class TabManager {
   // Initialize tabs
   init() {
     // Find all tabs and contents
-    this.tabs = Array.from(this.container.querySelectorAll('.nav-tab'));
+    this.tabs = Array.from(this.container.querySelectorAll('.nav-tab[data-tab]'));
     this.tabContents = Array.from(this.container.querySelectorAll('.tab-content'));
     
     // Set up event listeners

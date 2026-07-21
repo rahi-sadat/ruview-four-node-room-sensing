@@ -34,6 +34,8 @@ const MAX_RECONNECT_ATTEMPTS = 20;
 // This prevents the UI from flashing "SIMULATED" on a brief hiccup.
 const SIM_FALLBACK_AFTER_ATTEMPTS = 5;
 const SIMULATION_INTERVAL = 500; // ms
+const NODE_STALE_AFTER_MS = 1200;
+const NODE_FORGET_AFTER_MS = 4500;
 
 class SensingService {
   constructor() {
@@ -59,6 +61,7 @@ class SensingService {
     // Ring buffer of recent RSSI values for sparkline
     this._rssiHistory = [];
     this._maxHistory = 60;
+    this._stableNodes = new Map();
   }
 
   // ---- Public API --------------------------------------------------------
@@ -327,6 +330,11 @@ class SensingService {
   // ---- Data handling -----------------------------------------------------
 
   _handleData(data) {
+    if (data && data.type && data.type !== 'sensing_update') {
+      return;
+    }
+
+    data = this._stabilizeNodes(data);
     this._lastMessage = data;
 
     // Track the server's source field from each frame so the UI
@@ -368,6 +376,112 @@ class SensingService {
         console.error('[Sensing] Listener error:', e);
       }
     }
+  }
+
+  _stabilizeNodes(data) {
+    if (!data || typeof data !== 'object') return data;
+
+    const now = Date.now();
+    const incoming = new Map();
+
+    for (const node of data.nodes || []) {
+      const nodeId = Number(node.node_id);
+      if (!Number.isFinite(nodeId)) continue;
+      const record = incoming.get(nodeId) || {};
+      record.node = { ...node };
+      incoming.set(nodeId, record);
+    }
+
+    for (const nodeFeature of data.node_features || []) {
+      const nodeId = Number(nodeFeature.node_id);
+      if (!Number.isFinite(nodeId)) continue;
+      const record = incoming.get(nodeId) || {};
+      record.nodeFeature = { ...nodeFeature };
+      incoming.set(nodeId, record);
+    }
+
+    for (const [nodeId, update] of incoming) {
+      const previous = this._stableNodes.get(nodeId) || {};
+      const node = update.node || this._nodeFromFeature(update.nodeFeature, previous.node);
+      const nodeFeature =
+        update.nodeFeature || this._featureFromNode(update.node, previous.nodeFeature);
+
+      this._stableNodes.set(nodeId, {
+        node,
+        nodeFeature,
+        lastSeenMs: now,
+      });
+    }
+
+    for (const [nodeId, snapshot] of this._stableNodes) {
+      if (now - snapshot.lastSeenMs > NODE_FORGET_AFTER_MS) {
+        this._stableNodes.delete(nodeId);
+      }
+    }
+
+    if (this._stableNodes.size === 0) {
+      return data;
+    }
+
+    const sortedSnapshots = [...this._stableNodes.entries()]
+      .sort(([a], [b]) => a - b)
+      .map(([nodeId, snapshot]) => {
+        const ageMs = Math.max(0, now - snapshot.lastSeenMs);
+        const stale = ageMs > NODE_STALE_AFTER_MS;
+        return {
+          nodeId,
+          ageMs,
+          stale,
+          node: snapshot.node,
+          nodeFeature: snapshot.nodeFeature,
+        };
+      });
+
+    return {
+      ...data,
+      nodes: sortedSnapshots
+        .filter((snapshot) => snapshot.node)
+        .map((snapshot) => ({
+          ...snapshot.node,
+          stale: snapshot.stale,
+          last_seen_ms: snapshot.ageMs,
+        })),
+      node_features: sortedSnapshots
+        .filter((snapshot) => snapshot.nodeFeature)
+        .map((snapshot) => ({
+          ...snapshot.nodeFeature,
+          stale: snapshot.stale,
+          last_seen_ms: snapshot.ageMs,
+        })),
+    };
+  }
+
+  _nodeFromFeature(nodeFeature, previousNode = null) {
+    if (!nodeFeature) return previousNode;
+    return {
+      ...(previousNode || {}),
+      node_id: nodeFeature.node_id,
+      rssi_dbm: nodeFeature.rssi_dbm ?? previousNode?.rssi_dbm ?? -80,
+      position: previousNode?.position || [0, 0, 0],
+      amplitude: previousNode?.amplitude || [],
+      subcarrier_count: previousNode?.subcarrier_count || 0,
+    };
+  }
+
+  _featureFromNode(node, previousFeature = null) {
+    if (!node) return previousFeature;
+    return {
+      ...(previousFeature || {}),
+      node_id: node.node_id,
+      rssi_dbm: node.rssi_dbm ?? previousFeature?.rssi_dbm ?? -80,
+      features: previousFeature?.features || {},
+      classification: previousFeature?.classification || {
+        motion_level: 'unknown',
+        presence: false,
+        confidence: 0,
+      },
+      stale: previousFeature?.stale ?? false,
+    };
   }
 
   // ---- State management --------------------------------------------------

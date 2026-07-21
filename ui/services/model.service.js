@@ -10,6 +10,20 @@ export class ModelService {
     this.logger = this.createLogger();
   }
 
+  normalizeModelInfo(data) {
+    if (!data) return null;
+    const info = data.active !== undefined ? data.active : data;
+    if (!info) return null;
+    const modelId = info.model_id || info.id || info.name || data.model_id || data.active_model_id;
+    if (!modelId) return null;
+    return {
+      ...info,
+      id: info.id || modelId,
+      model_id: modelId,
+      name: info.name || modelId
+    };
+  }
+
   createLogger() {
     return {
       debug: (...args) => console.debug('[MODEL-DEBUG]', new Date().toISOString(), ...args),
@@ -57,7 +71,7 @@ export class ModelService {
   async getModel(id) {
     try {
       const data = await apiService.get(`/api/v1/models/${encodeURIComponent(id)}`);
-      return data;
+      return this.normalizeModelInfo(data) || data;
     } catch (error) {
       this.logger.error('Failed to get model', { id, error: error.message });
       throw error;
@@ -68,8 +82,8 @@ export class ModelService {
     try {
       this.logger.info('Loading model', { modelId });
       const data = await apiService.post('/api/v1/models/load', { model_id: modelId });
-      this.activeModel = { model_id: modelId };
-      this.emit('model-loaded', { model_id: modelId });
+      this.activeModel = this.normalizeModelInfo(data?.model || data) || { model_id: modelId, id: modelId, name: modelId };
+      this.emit('model-loaded', this.activeModel);
       return data;
     } catch (error) {
       this.logger.error('Failed to load model', { modelId, error: error.message });
@@ -93,7 +107,7 @@ export class ModelService {
   async getActiveModel() {
     try {
       const data = await apiService.get('/api/v1/models/active');
-      this.activeModel = data || null;
+      this.activeModel = this.normalizeModelInfo(data);
       return this.activeModel;
     } catch (error) {
       if (error.status === 404) {

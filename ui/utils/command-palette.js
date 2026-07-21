@@ -30,6 +30,7 @@ export class CommandPalette {
       { id: 'applications', label: 'Applications', icon: 'box' },
       { id: 'sensing', label: 'Sensing', icon: 'wifi' },
       { id: 'training', label: 'Training', icon: 'database' },
+      { id: 'project-team', label: 'Project Team', icon: 'users' },
     ];
 
     tabs.forEach(tab => {

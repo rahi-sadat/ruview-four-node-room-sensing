@@ -37,6 +37,7 @@
             <button class="nav-tab" data-tab="applications" role="tab" aria-selected="false" aria-controls="applications">Applications</button>
             <button class="nav-tab" data-tab="sensing" role="tab" aria-selected="false" aria-controls="sensing">Sensing</button>
             <button class="nav-tab" data-tab="training" role="tab" aria-selected="false" aria-controls="training">Training</button>
+            <button class="nav-tab" data-tab="project-team" role="tab" aria-selected="false" aria-controls="project-team">Project Team</button>
             <a href="pose-fusion.html" class="nav-tab" style="text-decoration:none">Pose Fusion</a>
             <a href="observatory.html" class="nav-tab" style="text-decoration:none">Observatory</a>
         </nav>
@@ -142,6 +143,27 @@
                         <h4>Zone Occupancy</h4>
                         <div class="zones-summary"></div>
                     </div>
+                </div>
+
+                <div class="dashboard-team-panel">
+                    <div class="dashboard-team-heading">
+                        <span class="project-team-kicker">Project Team</span>
+                        <h3>Project Team</h3>
+                    </div>
+                    <div class="project-team-grid">
+                        <article class="project-member-card">
+                            <span class="project-member-label">Team Member</span>
+                            <h3>Rahi Sadat Ruhan</h3>
+                            <p>Roll: 2207088</p>
+                        </article>
+
+                        <article class="project-member-card">
+                            <span class="project-member-label">Team Member</span>
+                            <h3>Mehrab Hossen Sakal</h3>
+                            <p>Roll: 2207066</p>
+                        </article>
+                    </div>
+                    <a class="dashboard-team-link" href="#project-team">Open full team page</a>
                 </div>
                 
                 <div class="key-benefits">
@@ -510,12 +532,36 @@
                 <div id="model-panel-container" style="flex: 1; min-width: 350px; max-width: 450px;"></div>
             </div>
         </section>
+
+        <!-- Project Team Tab -->
+        <section id="project-team" class="tab-content" role="tabpanel" aria-labelledby="project-team" aria-hidden="true">
+            <div class="project-team-page">
+                <div class="project-team-header">
+                    <span class="project-team-kicker">RuView Dashboard Update</span>
+                    <h2>Project Team</h2>
+                </div>
+
+                <div class="project-team-grid">
+                    <article class="project-member-card">
+                        <span class="project-member-label">Team Member</span>
+                        <h3>Rahi Sadat Ruhan</h3>
+                        <p>Roll: 2207088</p>
+                    </article>
+
+                    <article class="project-member-card">
+                        <span class="project-member-label">Team Member</span>
+                        <h3>Mehrab Hossen Sakal</h3>
+                        <p>Roll: 2207066</p>
+                    </article>
+                </div>
+            </div>
+        </section>
     </div>
 
     <!-- Error Toast -->
     <div id="globalErrorToast" class="error-toast"></div>
 
     <!-- Load application scripts as modules -->
-    <script type="module" src="app.js"></script>
+    <script type="module" src="app.js?v=pose-cache-clear-20260713-2"></script>
 </body>
 </html>

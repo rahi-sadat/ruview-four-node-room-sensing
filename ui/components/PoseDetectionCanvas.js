@@ -1,8 +1,9 @@
 // PoseDetectionCanvas Component for WiFi-DensePose UI
 
-import { PoseRenderer } from '../utils/pose-renderer.js';
-import { poseService } from '../services/pose.service.js';
-import { SettingsPanel } from './SettingsPanel.js';
+import { PoseRenderer } from '../utils/pose-renderer.js?v=pose-cache-clear-20260713-2';
+import { poseService } from '../services/pose.service.js?v=pose-cache-clear-20260713-2';
+import { apiService } from '../services/api.service.js?v=pose-cache-clear-20260713-2';
+import { SettingsPanel } from './SettingsPanel.js?v=pose-cache-clear-20260713-2';
 
 export class PoseDetectionCanvas {
   constructor(containerId, options = {}) {
@@ -29,6 +30,8 @@ export class PoseDetectionCanvas {
       connectionState: 'disconnected',
       lastPoseData: null,
       errorMessage: null,
+      fallStatus: null,
+      fallEvent: null,
       frameCount: 0,
       startTime: Date.now()
     };
@@ -50,6 +53,9 @@ export class PoseDetectionCanvas {
     this.poseTrail = [];
     this.showTrail = false;
     this.maxTrailLength = 10;
+    this.fallPollTimer = null;
+    this.poseRestPollTimer = null;
+    this.lastWsPoseUpdateAt = 0;
 
     // Initialize component
     this.initializeComponent();
@@ -112,6 +118,11 @@ export class PoseDetectionCanvas {
           <canvas id="pose-canvas-${this.containerId}" class="pose-canvas"></canvas>
           <div class="pose-canvas-overlay" id="overlay-${this.containerId}">
             <div class="pose-stats" id="stats-${this.containerId}"></div>
+            <div class="fall-status-card" id="fall-status-${this.containerId}">
+              <div class="fall-status-title">FALL-LIKE MONITOR</div>
+              <div class="fall-status-body" id="fall-status-body-${this.containerId}">Waiting for CSI</div>
+              <button class="fall-ack-btn" id="fall-ack-btn-${this.containerId}" type="button">Acknowledge</button>
+            </div>
             <div class="pose-error" id="error-${this.containerId}" style="display: none;"></div>
           </div>
         </div>
@@ -367,6 +378,55 @@ export class PoseDetectionCanvas {
         max-width: 200px;
       }
 
+      .fall-status-card {
+        position: absolute;
+        left: 10px;
+        bottom: 10px;
+        width: min(260px, calc(100% - 20px));
+        background: rgba(5, 10, 18, 0.78);
+        color: #e5edf8;
+        border: 1px solid rgba(148, 163, 184, 0.25);
+        border-left: 4px solid #64748b;
+        border-radius: 6px;
+        padding: 10px;
+        font-size: 12px;
+        line-height: 1.35;
+        pointer-events: auto;
+      }
+
+      .fall-status-card.alert {
+        border-left-color: #f59e0b;
+        background: rgba(47, 28, 3, 0.88);
+      }
+
+      .fall-status-card .fall-status-title {
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.4px;
+        color: #cbd5e1;
+        margin-bottom: 5px;
+      }
+
+      .fall-status-body {
+        white-space: pre-line;
+      }
+
+      .fall-ack-btn {
+        margin-top: 8px;
+        padding: 5px 8px;
+        border: 1px solid rgba(255, 255, 255, 0.18);
+        border-radius: 5px;
+        background: rgba(15, 23, 42, 0.8);
+        color: #e5edf8;
+        font-size: 11px;
+        cursor: pointer;
+      }
+
+      .fall-ack-btn:disabled {
+        opacity: 0.45;
+        cursor: not-allowed;
+      }
+
       .pose-error {
         position: absolute;
         top: 50%;
@@ -449,6 +509,9 @@ export class PoseDetectionCanvas {
     const settingsBtn = document.getElementById(`settings-btn-${this.containerId}`);
     settingsBtn.addEventListener('click', () => this.showSettings());
 
+    const fallAckBtn = document.getElementById(`fall-ack-btn-${this.containerId}`);
+    fallAckBtn.addEventListener('click', () => this.acknowledgeFallEvent());
+
     // Mode selector
     const modeSelect = document.getElementById(`mode-select-${this.containerId}`);
     modeSelect.addEventListener('change', (event) => {
@@ -472,12 +535,35 @@ export class PoseDetectionCanvas {
     try {
       switch (update.type) {
         case 'pose_update':
+          this.lastWsPoseUpdateAt = Date.now();
           this.state.lastPoseData = update.data;
+          if (update.data?.fall_status) {
+            this.state.fallStatus = update.data.fall_status;
+            this.renderFallStatus();
+          }
           this.state.frameCount++;
           this.updateTrail(update.data);
           this.renderPoseData(update.data);
           this.updateStats();
           this.notifyCallback('onPoseUpdate', update.data);
+          break;
+
+        case 'fall_status':
+          this.state.fallStatus = update.data;
+          this.renderFallStatus();
+          break;
+
+        case 'fall_event':
+          this.state.fallEvent = update.data;
+          this.state.fallStatus = {
+            ...(this.state.fallStatus || {}),
+            state: 'FALL_LIKE_CONFIRMED',
+            label: update.data?.label || 'FALL-LIKE EVENT',
+            confidence: update.data?.confidence || 0,
+            acknowledged: update.data?.acknowledged || false,
+            last_event: update.data
+          };
+          this.renderFallStatus();
           break;
 
         case 'connected':
@@ -600,6 +686,8 @@ export class PoseDetectionCanvas {
     const fps = this.renderer.getPerformanceMetrics().averageFps;
     const persons = this.state.lastPoseData?.persons?.length || 0;
     const zones = Object.keys(this.state.lastPoseData?.zone_summary || {}).length;
+    const poseLabel = this.state.lastPoseData?.pose_label || 'NO VALID POSE';
+    const diagnostics = this.state.lastPoseData?.diagnostics || {};
 
     // Use textContent instead of innerHTML to prevent XSS
     statsEl.textContent = '';
@@ -608,6 +696,8 @@ export class PoseDetectionCanvas {
       `Frames: ${this.state.frameCount}`,
       `FPS: ${fps.toFixed(1)}`,
       `Persons: ${persons}`,
+      `Pose: ${poseLabel}`,
+      `Nodes: ${diagnostics.active_nodes ?? 0}`,
       `Zones: ${zones}`,
       `Uptime: ${uptime}s`
     ];
@@ -618,6 +708,127 @@ export class PoseDetectionCanvas {
       const textNode = document.createTextNode(line);
       statsEl.appendChild(textNode);
     });
+  }
+
+  normalizeRestPoseData(poseData) {
+    const persons = Array.isArray(poseData?.persons) ? poseData.persons : [];
+    const hasDrawablePose = persons.some((person) =>
+      Array.isArray(person?.keypoints) &&
+      person.keypoints.some((kp) => Number.isFinite(kp?.x) && Number.isFinite(kp?.y))
+    );
+    const poseMode = poseData?.pose_mode || (hasDrawablePose ? 'heuristic' : 'none');
+    return {
+      ...poseData,
+      persons,
+      pose_source: poseData?.pose_source || (poseMode === 'trained' ? 'model_inference' : 'signal_derived'),
+      pose_mode: poseMode,
+      pose_label: poseData?.pose_label || (
+        poseMode === 'trained'
+          ? 'TRAINED POSE'
+          : poseMode === 'heuristic'
+            ? 'HEURISTIC CSI POSE - NOT TRAINED'
+            : 'NO VALID POSE'
+      ),
+      diagnostics: poseData?.diagnostics || {
+        active_nodes: Array.isArray(poseData?.nodes) ? poseData.nodes.length : 0,
+        total_keypoints: persons.reduce((n, p) => n + (Array.isArray(p.keypoints) ? p.keypoints.length : 0), 0),
+        drawable_keypoints: persons.reduce((n, p) => (
+          n + (Array.isArray(p.keypoints)
+            ? p.keypoints.filter((kp) => Number.isFinite(kp?.x) && Number.isFinite(kp?.y)).length
+            : 0)
+        ), 0),
+        mean_source_confidence: persons.length
+          ? persons.reduce((sum, p) => sum + (Number.isFinite(p.confidence) ? p.confidence : 0), 0) / persons.length
+          : 0,
+      },
+    };
+  }
+
+  startPoseRestPolling() {
+    if (this.poseRestPollTimer) return;
+    const poll = async () => {
+      if (!this.state.isActive) return;
+      if (Date.now() - this.lastWsPoseUpdateAt < 1800) return;
+      try {
+        const poseData = this.normalizeRestPoseData(await poseService.getCurrentPose());
+        this.state.lastPoseData = poseData;
+        this.state.frameCount++;
+        this.updateTrail(poseData);
+        this.renderPoseData(poseData);
+        this.updateStats();
+        this.notifyCallback('onPoseUpdate', poseData);
+        if (this.state.connectionState !== 'connected') {
+          this.setConnectionState('connected');
+        }
+      } catch (error) {
+        this.logger.debug('REST pose poll skipped', { error: error.message });
+      }
+    };
+    poll();
+    this.poseRestPollTimer = window.setInterval(poll, 1200);
+  }
+
+  stopPoseRestPolling() {
+    if (this.poseRestPollTimer) {
+      window.clearInterval(this.poseRestPollTimer);
+      this.poseRestPollTimer = null;
+    }
+  }
+
+  renderFallStatus() {
+    const card = document.getElementById(`fall-status-${this.containerId}`);
+    const body = document.getElementById(`fall-status-body-${this.containerId}`);
+    const ackBtn = document.getElementById(`fall-ack-btn-${this.containerId}`);
+    if (!card || !body || !ackBtn) return;
+
+    const status = this.state.fallStatus || {};
+    const isAlert = status.state === 'FALL_LIKE_CONFIRMED' && status.acknowledged !== true;
+    card.classList.toggle('alert', isAlert);
+    ackBtn.disabled = !isAlert;
+
+    const confidence = Number.isFinite(status.confidence) ? status.confidence : 0;
+    const impact = Number.isFinite(status.impact_score) ? status.impact_score : 0;
+    const stillness = Number.isFinite(status.stillness_score) ? status.stillness_score : 0;
+    const agreeing = Array.isArray(status.agreeing_nodes) ? status.agreeing_nodes.length : 0;
+    const active = status.active_nodes || 0;
+    body.textContent = [
+      `${status.label || 'NO FALL-LIKE EVENT'} (${status.state || 'WAITING'})`,
+      `Confidence: ${(confidence * 100).toFixed(1)}%`,
+      `Impact z: ${impact.toFixed(1)} | Stillness: ${(stillness * 100).toFixed(0)}%`,
+      `Nodes: ${agreeing}/${active}`
+    ].join('\n');
+  }
+
+  startFallStatusPolling() {
+    if (this.fallPollTimer) return;
+    const poll = async () => {
+      try {
+        const status = await apiService.get('/api/v1/fall/status');
+        this.state.fallStatus = status;
+        this.renderFallStatus();
+      } catch (error) {
+        this.logger.debug('Fall status poll skipped', { error: error.message });
+      }
+    };
+    poll();
+    this.fallPollTimer = window.setInterval(poll, 1000);
+  }
+
+  stopFallStatusPolling() {
+    if (this.fallPollTimer) {
+      window.clearInterval(this.fallPollTimer);
+      this.fallPollTimer = null;
+    }
+  }
+
+  async acknowledgeFallEvent() {
+    try {
+      const response = await apiService.post('/api/v1/fall/acknowledge', {});
+      this.state.fallStatus = response?.fall_status || this.state.fallStatus;
+      this.renderFallStatus();
+    } catch (error) {
+      this.showError(`Fall acknowledge failed: ${error.message}`);
+    }
   }
 
   showError(message) {
@@ -648,12 +859,18 @@ export class PoseDetectionCanvas {
       
       this.clearError();
       this.updateControls();
+      this.startFallStatusPolling();
+      this.startPoseRestPolling();
 
-      await poseService.startPoseStream({
-        zoneIds: [this.config.zoneId],
-        minConfidence: 0.3,
-        maxFps: 30
-      });
+      try {
+        await poseService.startPoseStream({
+          zoneIds: [this.config.zoneId],
+          minConfidence: 0.3,
+          maxFps: 30
+        });
+      } catch (streamError) {
+        this.logger.warn('Pose WebSocket unavailable; using REST pose polling', { error: streamError.message });
+      }
 
       this.notifyCallback('onStateChange', { isActive: true });
       this.logger.info('Pose detection started successfully');
@@ -672,6 +889,8 @@ export class PoseDetectionCanvas {
       this.state.isActive = false;
       
       poseService.stopPoseStream();
+      this.stopFallStatusPolling();
+      this.stopPoseRestPolling();
       this.setConnectionState('disconnected');
       this.clearError();
       this.updateControls();
@@ -1518,6 +1737,8 @@ export class PoseDetectionCanvas {
       if (this.state.isActive) {
         this.stop();
       }
+      this.stopFallStatusPolling();
+      this.stopPoseRestPolling();
 
       // Stop demo animation
       this.stopDemo();

@@ -3,7 +3,7 @@
 #
 # Supports two usage patterns:
 #
-# 1. No arguments — use defaults from environment:
+# 1. No arguments - use defaults from environment:
 #      docker run -e CSI_SOURCE=esp32 ruvnet/wifi-densepose:latest
 #
 # 2. Pass CLI flags directly:
@@ -11,32 +11,32 @@
 #      docker run ruvnet/wifi-densepose:latest --model /app/models/my.rvf
 #
 # Environment variables:
-#   CSI_SOURCE   — data source. Valid values:
-#                    auto       — try ESP32 then Windows WiFi, **fail-loud if no
+#   CSI_SOURCE   - data source. Valid values:
+#                    auto       - try ESP32 then Windows WiFi, **fail-loud if no
 #                                 real hardware is detected** (issue #937 fix:
 #                                 the server no longer silently falls back to
-#                                 synthetic data — that's now opt-in only).
-#                    esp32      — listen for UDP CSI on the configured port.
-#                    wifi       — Windows-native WiFi capture.
-#                    simulated  — explicit demo mode with synthetic CSI.
+#                                 synthetic data - that's now opt-in only).
+#                    esp32      - listen for UDP CSI on the configured port.
+#                    wifi       - Windows-native WiFi capture.
+#                    simulated  - explicit demo mode with synthetic CSI.
 #                  Default is `auto`. Set CSI_SOURCE=simulated when you want
 #                  fake data tagged as such; never set it implicitly.
-#   MODELS_DIR   — directory to scan for .rvf model files (default: data/models)
+#   MODELS_DIR   - directory to scan for .rvf model files (default: data/models)
 set -e
 
-# ── Issue #864: fail-closed on default posture ───────────────────────────────
+# Issue #864: fail-closed on default posture
 # The pre-fix default was: empty RUVIEW_API_TOKEN (auth off) + --bind-addr
-# 0.0.0.0 + docker-compose publishing :3000/:3001/:5005 → an unauthenticated
+# 0.0.0.0 + docker-compose publishing :3000/:3001/:5005 -> an unauthenticated
 # attacker on any reachable network segment could read /api/v1/sensing/latest
 # and the /ws/sensing live stream. That posture is unsafe on guest WiFi,
 # untrusted LANs, accidentally-port-forwarded hosts, or any reverse-proxied
 # deployment. Refuse to start with this combination.
 #
 # Escape hatches (operator must opt in explicitly):
-#   * Set RUVIEW_API_TOKEN to a strong secret → auth enabled on /api/v1/*.
-#   * Set RUVIEW_ALLOW_UNAUTHENTICATED=1 → preserves the pre-fix behaviour;
+#   * Set RUVIEW_API_TOKEN to a strong secret -> auth enabled on /api/v1/*.
+#   * Set RUVIEW_ALLOW_UNAUTHENTICATED=1 -> preserves the pre-fix behaviour;
 #     only safe on an isolated trust boundary.
-#   * Set RUVIEW_BIND_ADDR to a loopback / private interface → unauth is fine
+#   * Set RUVIEW_BIND_ADDR to a loopback / private interface -> unauth is fine
 #     when the socket isn't reachable. The auto-bind nudges toward 127.0.0.1.
 #
 # This check runs only for the default sensing-server path (no args + flag-only
