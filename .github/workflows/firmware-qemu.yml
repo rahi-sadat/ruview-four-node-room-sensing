@@ -104,7 +104,7 @@ jobs:
           submodules: recursive
 
       - name: Download QEMU artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: qemu-esp32
           path: /opt/qemu-esp32
@@ -327,7 +327,7 @@ jobs:
           submodules: recursive
 
       - name: Download QEMU artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: qemu-esp32
           path: /opt/qemu-esp32
