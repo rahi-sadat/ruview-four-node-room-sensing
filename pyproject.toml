@@ -94,7 +94,7 @@ dependencies = [
     
     # HTTP client
     "httpx>=0.25.0",
-    "aiofiles>=23.2.0",
+    "aiofiles>=25.1.0",
     
     # Validation and serialization
     "marshmallow>=3.20.0",
