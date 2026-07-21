@@ -32,14 +32,15 @@ Starting from the RuView repository, we explored the live sensing flow and added
 
 ### Dashboard updates
 
-- Added a `Project Team` tab to the main UI.
-- Added project team cards for Rahi Sadat Ruhan and Mehrab Hossen Sakal.
+
 - Improved live sensing node stability so nodes do not disappear immediately during short message gaps.
 - Added pose status labels:
   - `TRAINED POSE`
   - `HEURISTIC CSI POSE - NOT TRAINED`
   - `NO VALID POSE`
 - Added a fall-like monitor card with confidence, node agreement, and acknowledge button.
+- Added a `Project Team` tab to the main UI.
+- Added project team cards for Rahi Sadat Ruhan and Mehrab Hossen Sakal.
 
 ### Backend updates
 
