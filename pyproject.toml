@@ -55,7 +55,7 @@ dependencies = [
     "psycopg2-binary>=2.9.0",
     
     # Redis (optional)
-    "redis>=5.0.0",
+    "redis>=8.0.1",
     "aioredis>=2.0.0",
     
     # Neural networks and ML
